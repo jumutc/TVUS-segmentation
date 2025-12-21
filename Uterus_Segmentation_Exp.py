@@ -410,3 +410,30 @@ if __name__ == '__main__':
         'neptune_project': args.neptune_project,
         'dataset_name': args.dataset_name,
     })
+    ex.run(config_updates={
+        'losses': "[smp.losses.TverskyLoss('binary')]",
+        'encoder_name': 'efficientnet-b7',
+        'model_name': 'DeepLabV3Plus',
+        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 30, 'activation': None, 'classes': 1},
+        'image_path': args.image_path,
+        'seg_path': args.seg_path,
+        'model_output': args.model_output,
+        'csv_output': args.csv_output,
+        'sacred_runs': args.sacred_runs,
+        'neptune_project': args.neptune_project,
+        'dataset_name': args.dataset_name,
+    })
+    ex.run(config_updates={
+        'losses': "[smp.losses.TverskyLoss('binary')]",
+        'encoder_name': 'efficientnet-b7',
+        'model_name': 'DeepLabV3Plus',
+        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 60, 'activation': None, 'classes': 1},
+        'image_path': args.image_path,
+        'seg_path': args.seg_path,
+        'model_output': args.model_output,
+        'csv_output': args.csv_output,
+        'sacred_runs': args.sacred_runs,
+        'neptune_project': args.neptune_project,
+        'dataset_name': args.dataset_name,
+    })
+
