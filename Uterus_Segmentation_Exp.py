@@ -82,7 +82,7 @@ class UterusDataset(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        img = np.repeat(self.X.loc[idx]['img'], 3, axis=-1)
+        img = self.X.loc[idx]['img']
         mask = self.X.loc[idx]['seg']
         
         # Ensure consistent dtype for OpenCV compatibility (float32 for albumentations)
@@ -348,7 +348,6 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
 
         t_train = A.Compose(
             [A.Resize(height, width, interpolation=cv2.INTER_NEAREST), A.HorizontalFlip(), A.VerticalFlip(),
-             A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise(),
              A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
 
         t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST),
@@ -402,7 +401,7 @@ if __name__ == '__main__':
         'encoder_name': 'inceptionresnetv2',
         'model_name': 'MAnet',
         'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1,
-                         'encoder_depth': 6, 'decoder_channels': (512, 256, 128, 64, 32, 16)},
+                         'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
         'model_output': args.model_output,
@@ -415,7 +414,8 @@ if __name__ == '__main__':
         'losses': "[smp.losses.TverskyLoss('binary')]",
         'encoder_name': 'efficientnet-b7',
         'model_name': 'DeepLabV3Plus',
-        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 30, 'activation': None, 'classes': 1},
+        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 80, 'activation': None, 'classes': 1,
+                         'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
         'model_output': args.model_output,
@@ -428,7 +428,8 @@ if __name__ == '__main__':
         'losses': "[smp.losses.TverskyLoss('binary')]",
         'encoder_name': 'efficientnet-b7',
         'model_name': 'DeepLabV3Plus',
-        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 60, 'activation': None, 'classes': 1},
+        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 60, 'activation': None, 'classes': 1,
+                         'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
         'model_output': args.model_output,
