@@ -349,7 +349,6 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
 
         t_train = A.Compose(
             [A.Resize(height, width, interpolation=cv2.INTER_NEAREST), A.HorizontalFlip(), A.VerticalFlip(),
-             A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise(),
              A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
 
         t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST),
