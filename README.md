@@ -13,14 +13,15 @@ Transvaginal Ultrasound (TVUS) is a critical imaging modality used in gynecologi
 
 This repository implements multiple deep learning approaches for uterine segmentation:
 
-- **DeepLabV3Plus** with EfficientNet encoders (using `segmentation-models-pytorch`)
+- **Configurable Model Architectures**: MAnet, DeepLabV3Plus, Unet, and more (using `segmentation-models-pytorch`)
+- **Flexible Encoders**: EfficientNet, InceptionResNetV2, and other encoders from `segmentation-models-pytorch`
 - **nnUNet v2** framework for medical image segmentation
 - Support for both **2D slice-based** and **3D volume** segmentation
 - Multiple loss functions (Tversky Loss, Focal Loss, Soft BCE Loss)
 
 ## Features
 
-- 🏥 **Multiple Model Architectures**: DeepLabV3Plus and nnUNet v2 implementations
+- 🏥 **Configurable Model Architectures**: MAnet, DeepLabV3Plus, Unet, and nnUNet v2 implementations
 - 📊 **Comprehensive Evaluation**: IoU, NSD (Normalized Surface Distance), and Dice coefficient metrics
 - 🔄 **Cross-Validation**: GroupShuffleSplit with patient-level splitting to prevent data leakage
 - 📈 **Experiment Tracking**: Integration with Neptune.ai and Sacred for experiment management
@@ -82,7 +83,7 @@ TVUS-segmentation/
 
 ### Training Models
 
-#### 1. DeepLabV3Plus on Public Dataset (UterUS)
+#### 1. Segmentation Model on Public Dataset (UterUS)
 
 Train a segmentation model using the public UterUS dataset with NIfTI format:
 
@@ -106,7 +107,9 @@ python Uterus_Segmentation_Exp.py \
 - `--neptune_project`: Neptune project name (default: `jumutc/uterus`)
 - `--dataset_name`: Dataset name for logging (default: `UterUS (public)`)
 
-#### 2. DeepLabV3Plus on Private Dataset
+**Note**: Model architecture, encoder, and parameters are configured in the script via Sacred config. See the Configuration section below for details.
+
+#### 2. Segmentation Model on Private Dataset
 
 Train on a private dataset with image files:
 
@@ -120,6 +123,8 @@ python Uterus_Segmentation_Private_Exp.py \
     --neptune_project jumutc/uterus \
     --dataset_name "TVUS (private)"
 ```
+
+**Note**: Model architecture, encoder, and parameters are configured in the script via Sacred config. See the Configuration section below for details.
 
 #### 3. nnUNet v2 on Public Dataset
 
@@ -221,6 +226,33 @@ python inspect_pairs.py /path/to/images /path/to/masks
 
 ## Configuration
 
+### Model Architecture
+
+The model architecture is fully configurable through Sacred experiment configuration. You can modify the model settings in the experiment scripts:
+
+**Configurable Parameters**:
+- `model_name`: Model architecture (e.g., `'MAnet'`, `'DeepLabV3Plus'`, `'Unet'`, `'FPN'`, `'Linknet'`, `'PSPNet'`)
+- `encoder_name`: Encoder backbone (e.g., `'efficientnet-b7'`, `'inceptionresnetv2'`, `'resnet50'`, `'resnet101'`)
+- `model_params`: Dictionary of model-specific parameters:
+  - `encoder_weights`: Pre-trained weights (e.g., `'imagenet'`, `'imagenet+background'`)
+  - `decoder_channels`: Number of decoder channels (for DeepLabV3Plus)
+  - `activation`: Activation function (e.g., `None`, `'sigmoid'`, `'softmax'`)
+  - `classes`: Number of output classes (typically `1` for binary segmentation)
+
+**Example Configurations**:
+
+```python
+# MAnet with InceptionResNetV2
+'model_name': 'MAnet',
+'encoder_name': 'inceptionresnetv2',
+'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1}
+
+# DeepLabV3Plus with EfficientNet-B7
+'model_name': 'DeepLabV3Plus',
+'encoder_name': 'efficientnet-b7',
+'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 60, 'activation': None, 'classes': 1}
+```
+
 ### Loss Functions
 
 The training scripts support multiple loss functions configured via Sacred:
@@ -229,15 +261,16 @@ The training scripts support multiple loss functions configured via Sacred:
 - `FocalLoss`: Focuses on hard examples
 - `SoftBCEWithLogitsLoss`: Smooth binary cross-entropy
 
-### Model Architecture
+### Data Augmentation
 
-- **Encoder**: EfficientNet-B7 (default)
-- **Decoder**: DeepLabV3Plus
-- **Input Size**: Configurable (default: 224x192 for public, 512x768 for private)
-- **Batch Size**: 16 for training, 1 for validation
+- **Training**: Resize, HorizontalFlip, VerticalFlip, Rotate, MotionBlur, ZoomBlur, Defocus, GaussNoise, Normalize (min_max)
+- **Validation**: Resize, Normalize (min_max)
+- **Normalization**: Uses `min_max` normalization (normalizes to [0, 1] range)
 
 ### Training Parameters
 
+- **Input Size**: Configurable (default: 224x192 for public dataset, 512x768 for private dataset)
+- **Batch Size**: 16 for training, 1 for validation (public dataset); 2 for training, 1 for validation (private dataset)
 - **Learning Rate**: 1e-4 (max_lr for OneCycleLR)
 - **Epochs**: 200
 - **Weight Decay**: 1e-4
