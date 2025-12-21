@@ -26,7 +26,6 @@ from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
 from tqdm import tqdm
-from triton._C.libtriton.triton.ir import value
 
 ssl._create_default_https_context = ssl._create_unverified_context
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,6 +84,10 @@ class UterusDataset(Dataset):
     def __getitem__(self, idx):
         img = np.repeat(self.X.loc[idx]['img'], 3, axis=-1)
         mask = self.X.loc[idx]['seg']
+        
+        # Ensure consistent dtype for OpenCV compatibility (float32 for albumentations)
+        img = img.astype(np.float32)
+        mask = mask.astype(np.float32)
 
         aug = self.transform(image=img, mask=mask)
 
@@ -252,6 +255,8 @@ def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, opt
 def config():
     losses = []
     encoder_name = ''
+    model_name = 'MAnet'
+    model_params = {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1}
     image_path = ''
     seg_path = ''
     model_output = 'model.pt'
@@ -272,8 +277,27 @@ def get_encoder_name(encoder_name):
 
 
 @ex.capture
+def get_model_name(model_name):
+    return model_name
+
+
+@ex.capture
+def get_model_params(model_params):
+    return model_params
+
+
+@ex.capture
 def get_config(image_path, seg_path, model_output, csv_output, sacred_runs, neptune_project, dataset_name):
     return image_path, seg_path, model_output, csv_output, sacred_runs, neptune_project, dataset_name
+
+
+def create_model(model_name, encoder_name, model_params):
+    """Create a segmentation model based on configuration."""
+    model_class = getattr(smp, model_name)
+    # Merge encoder_name into model_params
+    params = model_params.copy()
+    params['encoder_name'] = encoder_name
+    return model_class(**params)
 
 
 @ex.main
@@ -304,6 +328,8 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
         'img_height': height,
         'img_width': width,
         'encoder': get_encoder_name(),
+        'model': get_model_name(),
+        'model_params': get_model_params(),
         'losses': get_losses()
     }
 
@@ -317,14 +343,16 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
         torch.manual_seed(i)
         np.random.seed(i)
 
-        model = smp.DeepLabV3Plus(get_encoder_name(), encoder_weights='imagenet', decoder_channels=60, activation=None, classes=1)
+        model = create_model(get_model_name(), get_encoder_name(), get_model_params())
         optimizer = torch.optim.Adam(model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
         t_train = A.Compose(
             [A.Resize(height, width, interpolation=cv2.INTER_NEAREST), A.HorizontalFlip(), A.VerticalFlip(),
-             A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise()], is_check_shapes=False)
+             A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise(),
+             A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
 
-        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST)], is_check_shapes=False)
+        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST),
+                           A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
         train_set = UterusDataset(df.loc[X_train].reset_index(), t_train)
         val_set = UterusDataset(df.loc[X_val].reset_index(), t_val)
 
@@ -371,7 +399,9 @@ if __name__ == '__main__':
     # Run experiments with command-line arguments
     ex.run(config_updates={
         'losses': "[smp.losses.TverskyLoss('binary')]",
-        'encoder_name': 'efficientnet-b7',
+        'encoder_name': 'inceptionresnetv2',
+        'model_name': 'MAnet',
+        'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
         'model_output': args.model_output,
@@ -380,26 +410,3 @@ if __name__ == '__main__':
         'neptune_project': args.neptune_project,
         'dataset_name': args.dataset_name,
     })
-    ex.run(config_updates={
-        'losses': "[smp.losses.FocalLoss('binary')]",
-        'encoder_name': 'efficientnet-b7',
-        'image_path': args.image_path,
-        'seg_path': args.seg_path,
-        'model_output': args.model_output,
-        'csv_output': args.csv_output,
-        'sacred_runs': args.sacred_runs,
-        'neptune_project': args.neptune_project,
-        'dataset_name': args.dataset_name,
-    })
-    ex.run(config_updates={
-        'losses': "[smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.1)]",
-        'encoder_name': 'efficientnet-b7',
-        'image_path': args.image_path,
-        'seg_path': args.seg_path,
-        'model_output': args.model_output,
-        'csv_output': args.csv_output,
-        'sacred_runs': args.sacred_runs,
-        'neptune_project': args.neptune_project,
-        'dataset_name': args.dataset_name,
-    })
-
