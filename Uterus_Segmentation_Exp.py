@@ -98,7 +98,7 @@ class UterusDataset(Dataset):
         t = T.Compose([T.ToTensor()])
         img = t(img).float()
 
-        return img, mask
+        return img, mask, idx
 
 
 def get_lr(optimizer):
@@ -106,7 +106,8 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, optimizer, scheduler, best_iou_scores, best_nsd_scores, best_dice_scores, fold, model_output_path):
+def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, optimizer, scheduler, best_iou_scores,
+        best_nsd_scores, best_dice_scores, fold, model_output_path, val_df):
     train_losses = []
     test_losses = []
     val_iou = []
@@ -129,7 +130,7 @@ def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, opt
         model.train()
         for i, data in enumerate(tqdm(train_loader)):
             # training phase
-            image, mask = data
+            image, mask, _ = data
 
             image = image.to(device)
             mask = mask.to(device)
@@ -158,25 +159,36 @@ def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, opt
             val_iou_scores = []
             val_nsd_scores = []
             val_dice_scores = []
-            images, gts, outputs = [], [], []
 
             # validation loop
             with torch.no_grad():
                 for i, data in enumerate(tqdm(val_loader)):
                     # reshape to 9 patches from single image, delete batch size
-                    image_tiles, mask_tiles = data
+                    image, mask, idx = data
 
-                    image = image_tiles.to(device)
-                    mask = mask_tiles.to(device)
-                    output = model(image)
+                    image = image.to(device)
+                    output = model(image).cpu()
+                    out = np.squeeze(output.detach().numpy(), axis=(0, 1))
+                    
+                    # Convert idx to scalar if it's a tensor/array
+                    if isinstance(idx, torch.Tensor):
+                        idx = idx.item()
+                    elif isinstance(idx, (np.ndarray, list)):
+                        idx = idx[0] if len(idx) > 0 else idx
+                    
+                    gt = val_df.loc[idx]['seg']
+                    gt = np.squeeze(gt)
+                    
+                    # Resize prediction to match GT if needed
+                    if out.shape != gt.shape:
+                        out = cv2.resize(out, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-                    images.append(image.cpu())
-                    outputs.append(output.cpu())
-                    gts.append(mask.cpu())
+                    # Binarize masks
+                    gt_binary = (gt > 0).astype(bool)
+                    out_binary = (out > 0).astype(bool)
 
-                    gt = np.squeeze(gts[-1].detach().numpy(), axis=(0, 1))
-                    out = np.squeeze(outputs[-1].detach().numpy(), axis=(0, 1))
-                    metrics.set_input(out > 0, gt > 0, spacing=(1, 1))
+                    # Compute metrics
+                    metrics.set_input(out_binary, gt_binary, spacing=(1, 1))
                     val_iou_scores.append(metrics.iou())
                     val_nsd_scores.append(metrics.nsd(2))
                     val_dice_scores.append(metrics.dsc())
@@ -308,7 +320,7 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
     best_iou_scores = {}
     best_nsd_scores = {}
     best_dice_scores = {}
-    height, width = 224, 192
+    height, width = 192, 128
 
     # Create dataframe
     df = create_df(image_path, seg_path)
@@ -352,8 +364,11 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
 
         t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST),
                            A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
-        train_set = UterusDataset(df.loc[X_train].reset_index(), t_train)
-        val_set = UterusDataset(df.loc[X_val].reset_index(), t_val)
+
+        train_df = df.loc[X_train].reset_index()
+        train_set = UterusDataset(train_df, t_train)
+        val_df = df.loc[X_val].reset_index()
+        val_set = UterusDataset(val_df, t_val)
 
         train_loader = DataLoader(train_set, batch_size=16, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_set, batch_size=1, shuffle=False, drop_last=False)
@@ -363,7 +378,7 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
                                                         pct_start=0.2)
 
         fit(_run, _neptune_run, epochs, model, train_loader, val_loader, eval(get_losses()), optimizer, scheduler,
-            best_iou_scores, best_nsd_scores, best_dice_scores, i, model_output)
+            best_iou_scores, best_nsd_scores, best_dice_scores, i, model_output, val_df)
 
     best_iou_scores = np.array(list(best_iou_scores.values()))
     best_nsd_scores = np.array(list(best_nsd_scores.values()))
@@ -412,10 +427,10 @@ if __name__ == '__main__':
     })
     ex.run(config_updates={
         'losses': "[smp.losses.TverskyLoss('binary')]",
-        'encoder_name': 'efficientnet-b7',
-        'model_name': 'DeepLabV3Plus',
-        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 256, 'activation': None, 'classes': 1,
-                         'in_channels': 1},
+        'encoder_name': 'inceptionresnetv2',
+        'model_name': 'UnetPlusPlus',
+        'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1,
+                         'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
         'model_output': args.model_output,
@@ -426,10 +441,10 @@ if __name__ == '__main__':
     })
     ex.run(config_updates={
         'losses': "[smp.losses.TverskyLoss('binary')]",
-        'encoder_name': 'inceptionresnetv2',
-        'model_name': 'UnetPlusPlus',
-        'model_params': {'encoder_weights': 'imagenet', 'activation': None, 'classes': 1,
-                         'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
+        'encoder_name': 'efficientnet-b7',
+        'model_name': 'DeepLabV3Plus',
+        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 256, 'activation': None, 'classes': 1,
+                         'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
         'model_output': args.model_output,
