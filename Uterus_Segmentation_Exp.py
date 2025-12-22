@@ -414,7 +414,7 @@ if __name__ == '__main__':
         'losses': "[smp.losses.TverskyLoss('binary')]",
         'encoder_name': 'efficientnet-b7',
         'model_name': 'DeepLabV3Plus',
-        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 80, 'activation': None, 'classes': 1,
+        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 256, 'activation': None, 'classes': 1,
                          'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
@@ -426,10 +426,10 @@ if __name__ == '__main__':
     })
     ex.run(config_updates={
         'losses': "[smp.losses.TverskyLoss('binary')]",
-        'encoder_name': 'efficientnet-b7',
-        'model_name': 'DeepLabV3Plus',
-        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 60, 'activation': None, 'classes': 1,
-                         'in_channels': 1},
+        'encoder_name': 'inceptionresnetv2',
+        'model_name': 'UnetPlusPlus',
+        'model_params': {'encoder_weights': 'imagenet', 'activation': None, 'classes': 1,
+                         'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
         'model_output': args.model_output,
