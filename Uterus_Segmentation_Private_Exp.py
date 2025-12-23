@@ -64,12 +64,12 @@ def create_df(image_path, seg_path):
         seg_masks = sorted(glob.glob(os.path.join(seg_path, volume_id, '*', 'masked_' + volume_id + '*')))
         preprocessed_paths = [find_in_paths(p, image_paths) for p in preprocessed_paths]
 
-        for image_path, seg_path in zip(preprocessed_paths, seg_masks):
-            images.append(cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB))
-            segmentations.append(cv2.imread(seg_path, cv2.IMREAD_GRAYSCALE))
+        for _image_path, _seg_path in zip(preprocessed_paths, seg_masks):
+            images.append(cv2.cvtColor(cv2.imread(_image_path), cv2.COLOR_BGR2RGB))
+            segmentations.append(cv2.imread(_seg_path, cv2.IMREAD_GRAYSCALE))
             volume_ids.append(volume_id)
-            img_paths.append(image_path)
-            seg_paths.append(seg_path)
+            img_paths.append(_image_path)
+            seg_paths.append(_seg_path)
 
     return pd.DataFrame({'img': images, 'seg': segmentations, 'volume_id': volume_ids, 'img_path': img_paths, 'seg_path': seg_paths},
                         index=np.arange(0, len(images)))
@@ -102,7 +102,7 @@ class TVUSDataset(Dataset):
         t = T.Compose([T.ToTensor()])
         img = t(img).float()
 
-        return img, mask
+        return img, mask, idx
 
 
 def get_lr(optimizer):
@@ -110,7 +110,7 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, optimizer, scheduler, best_iou_scores, best_nsd_scores, best_dice_scores, fold, model_output_path):
+def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, optimizer, scheduler, best_iou_scores, best_nsd_scores, best_dice_scores, fold, model_output_path, val_df):
     train_losses = []
     test_losses = []
     val_iou = []
@@ -133,7 +133,7 @@ def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, opt
         model.train()
         for i, data in enumerate(tqdm(train_loader)):
             # training phase
-            image, mask = data
+            image, mask, _ = data
 
             image = image.to(device)
             mask = mask.to(device)
@@ -168,23 +168,36 @@ def fit(_run, _neptune_run, epochs, model, train_loader, val_loader, losses, opt
             with torch.no_grad():
                 for i, data in enumerate(tqdm(val_loader)):
                     # reshape to 9 patches from single image, delete batch size
-                    image_tiles, mask_tiles = data
+                    image, mask, idx = data
 
-                    image = image_tiles.to(device)
-                    mask = mask_tiles.to(device)
-                    output = model(image)
+                    image = image.to(device)
+                    output = model(image).cpu()
+                    out = np.squeeze(output.detach().numpy(), axis=(0, 1))
+                    
+                    # Convert idx to scalar if it's a tensor/array
+                    if isinstance(idx, torch.Tensor):
+                        idx = idx.item()
+                    elif isinstance(idx, (np.ndarray, list)):
+                        idx = idx[0] if len(idx) > 0 else idx
+                    
+                    gt = val_df.loc[idx]['seg']
+                    gt = np.squeeze(gt)
+                    
+                    # Resize prediction to match GT if needed
+                    if out.shape != gt.shape:
+                        out = cv2.resize(out, (gt.shape[1], gt.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-                    images.append(image.cpu())
-                    outputs.append(output.cpu())
-                    gts.append(mask.cpu())
+                    # Binarize masks
+                    gt_binary = (gt > 0).astype(bool)
+                    out_binary = (out > 0).astype(bool)
 
-                    gt = np.squeeze(gts[-1].detach().numpy(), axis=(0, 1))
-                    out = np.squeeze(outputs[-1].detach().numpy(), axis=(0, 1))
-                    metrics.set_input(out > 0, gt > 0, spacing=(1, 1))
+                    # Compute metrics
+                    metrics.set_input(out_binary, gt_binary, spacing=(1, 1))
                     val_iou_scores.append(metrics.iou())
                     val_nsd_scores.append(metrics.nsd(6))
                     val_dice_scores.append(metrics.dsc())
 
+                    mask = mask.cpu()
                     for _loss in losses:
                         test_loss += _loss(output, mask).item()
 
@@ -268,6 +281,7 @@ def config():
     sacred_runs = 'uterus_runs'
     neptune_project = 'jumutc/uterus'
     dataset_name = 'TVUS (private)'
+    augmentations = '[A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise()]'
 
 
 @ex.capture
@@ -288,6 +302,11 @@ def get_model_name(model_name):
 @ex.capture
 def get_model_params(model_params):
     return model_params
+
+
+@ex.capture
+def get_augmentations(augmentations):
+    return augmentations
 
 
 def create_model(model_name, encoder_name, model_params):
@@ -331,6 +350,7 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
         'model': get_model_name(),
         'model_params': get_model_params(),
         'losses': get_losses(),
+        'augmentations': get_augmentations(),
         'dataset': 'private'
     }
 
@@ -347,14 +367,18 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
         model = create_model(get_model_name(), get_encoder_name(), get_model_params())
         optimizer = torch.optim.Adam(model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
+        augmentation_list = eval(get_augmentations())
         t_train = A.Compose(
-            [A.Resize(height, width, interpolation=cv2.INTER_NEAREST), A.HorizontalFlip(), A.VerticalFlip(),
-             A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
+            [A.Resize(height, width, interpolation=cv2.INTER_LINEAR), A.HorizontalFlip(), A.VerticalFlip()]
+            + augmentation_list
+            + [A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
 
-        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST),
+        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_LINEAR),
                            A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
-        train_set = TVUSDataset(df.loc[X_train].reset_index(), t_train)
-        val_set = TVUSDataset(df.loc[X_val].reset_index(), t_val)
+        train_df = df.loc[X_train].reset_index()
+        train_set = TVUSDataset(train_df, t_train)
+        val_df = df.loc[X_val].reset_index()
+        val_set = TVUSDataset(val_df, t_val)
 
         train_loader = DataLoader(train_set, batch_size=2, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_set, batch_size=1, shuffle=False, drop_last=False)
@@ -364,7 +388,7 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
                                                         pct_start=0.2)
 
         fit(_run, _neptune_run, epochs, model, train_loader, val_loader, eval(get_losses()), optimizer, scheduler,
-            best_iou_scores, best_nsd_scores, best_dice_scores, i, model_output)
+            best_iou_scores, best_nsd_scores, best_dice_scores, i, model_output, val_df)
 
     best_iou_scores = np.array(list(best_iou_scores.values()))
     best_nsd_scores = np.array(list(best_nsd_scores.values()))
@@ -390,6 +414,14 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
     _neptune_run.stop()
 
 
+def get_model_output_path(base_path, model_name, encoder_name, has_aug):
+    """Generate a unique model output path with postfix."""
+    base_name, ext = os.path.splitext(base_path)
+    aug_suffix = '_aug' if has_aug else '_noaug'
+    postfix = f"_{model_name}_{encoder_name}_{aug_suffix}"
+    return f"{base_name}{postfix}{ext}"
+
+
 if __name__ == '__main__':
     args = parse_args()
     
@@ -402,9 +434,24 @@ if __name__ == '__main__':
         'encoder_name': 'efficientnet-b7',
         'model_name': 'DeepLabV3Plus',
         'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 256, 'activation': None, 'classes': 1},
+        'augmentations': '[]',
         'image_path': args.image_path,
         'seg_path': args.seg_path,
-        'model_output': args.model_output,
+        'model_output': get_model_output_path(args.model_output, 'DeepLabV3Plus', 'efficientnet-b7', False),
+        'csv_output': args.csv_output,
+        'sacred_runs': args.sacred_runs,
+        'neptune_project': args.neptune_project,
+        'dataset_name': args.dataset_name,
+    })
+    ex.run(config_updates={
+        'losses': "[smp.losses.TverskyLoss('binary')]",
+        'encoder_name': 'efficientnet-b7',
+        'model_name': 'DeepLabV3Plus',
+        'model_params': {'encoder_weights': 'imagenet', 'decoder_channels': 256, 'activation': None, 'classes': 1},
+        'augmentations': '[A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise()]',
+        'image_path': args.image_path,
+        'seg_path': args.seg_path,
+        'model_output': get_model_output_path(args.model_output, 'DeepLabV3Plus', 'efficientnet-b7', True),
         'csv_output': args.csv_output,
         'sacred_runs': args.sacred_runs,
         'neptune_project': args.neptune_project,
@@ -416,9 +463,25 @@ if __name__ == '__main__':
         'model_name': 'MAnet',
         'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1,
                          'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32)},
+        'augmentations': '[]',
         'image_path': args.image_path,
         'seg_path': args.seg_path,
-        'model_output': args.model_output,
+        'model_output': get_model_output_path(args.model_output, 'MAnet', 'inceptionresnetv2', False),
+        'csv_output': args.csv_output,
+        'sacred_runs': args.sacred_runs,
+        'neptune_project': args.neptune_project,
+        'dataset_name': args.dataset_name,
+    })
+    ex.run(config_updates={
+        'losses': "[smp.losses.TverskyLoss('binary')]",
+        'encoder_name': 'inceptionresnetv2',
+        'model_name': 'MAnet',
+        'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1,
+                         'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32)},
+        'augmentations': '[A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise()]',
+        'image_path': args.image_path,
+        'seg_path': args.seg_path,
+        'model_output': get_model_output_path(args.model_output, 'MAnet', 'inceptionresnetv2', True),
         'csv_output': args.csv_output,
         'sacred_runs': args.sacred_runs,
         'neptune_project': args.neptune_project,
@@ -428,11 +491,27 @@ if __name__ == '__main__':
         'losses': "[smp.losses.TverskyLoss('binary')]",
         'encoder_name': 'inceptionresnetv2',
         'model_name': 'UnetPlusPlus',
-        'model_params': {'encoder_weights': 'imagenet', 'activation': None, 'classes': 1,
+        'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1,
                          'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
+        'augmentations': '[]',
         'image_path': args.image_path,
         'seg_path': args.seg_path,
-        'model_output': args.model_output,
+        'model_output': get_model_output_path(args.model_output, 'UnetPlusPlus', 'inceptionresnetv2', False),
+        'csv_output': args.csv_output,
+        'sacred_runs': args.sacred_runs,
+        'neptune_project': args.neptune_project,
+        'dataset_name': args.dataset_name,
+    })
+    ex.run(config_updates={
+        'losses': "[smp.losses.TverskyLoss('binary')]",
+        'encoder_name': 'inceptionresnetv2',
+        'model_name': 'UnetPlusPlus',
+        'model_params': {'encoder_weights': 'imagenet+background', 'activation': None, 'classes': 1,
+                         'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
+        'augmentations': '[A.Rotate(p=0.2), A.MotionBlur(), A.ZoomBlur(), A.Defocus(), A.GaussNoise()]',
+        'image_path': args.image_path,
+        'seg_path': args.seg_path,
+        'model_output': get_model_output_path(args.model_output, 'UnetPlusPlus', 'inceptionresnetv2', True),
         'csv_output': args.csv_output,
         'sacred_runs': args.sacred_runs,
         'neptune_project': args.neptune_project,

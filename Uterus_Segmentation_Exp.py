@@ -320,7 +320,7 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
     best_iou_scores = {}
     best_nsd_scores = {}
     best_dice_scores = {}
-    height, width = 192, 128
+    height, width = 256, 192
 
     # Create dataframe
     df = create_df(image_path, seg_path)
@@ -359,10 +359,10 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
         optimizer = torch.optim.Adam(model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
         t_train = A.Compose(
-            [A.Resize(height, width, interpolation=cv2.INTER_NEAREST), A.HorizontalFlip(), A.VerticalFlip(),
+            [A.Resize(height, width, interpolation=cv2.INTER_LINEAR), A.HorizontalFlip(), A.VerticalFlip(),
              A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
 
-        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST),
+        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_LINEAR),
                            A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
 
         train_df = df.loc[X_train].reset_index()
@@ -404,6 +404,13 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
     _neptune_run.stop()
 
 
+def get_model_output_path(base_path, model_name, encoder_name):
+    """Generate a unique model output path with postfix."""
+    base_name, ext = os.path.splitext(base_path)
+    postfix = f"_{model_name}_{encoder_name}"
+    return f"{base_name}{postfix}{ext}"
+
+
 if __name__ == '__main__':
     args = parse_args()
     
@@ -419,7 +426,7 @@ if __name__ == '__main__':
                          'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
-        'model_output': args.model_output,
+        'model_output': get_model_output_path(args.model_output, 'MAnet', 'inceptionresnetv2'),
         'csv_output': args.csv_output,
         'sacred_runs': args.sacred_runs,
         'neptune_project': args.neptune_project,
@@ -433,7 +440,7 @@ if __name__ == '__main__':
                          'encoder_depth': 5, 'decoder_channels': (512, 256, 128, 64, 32), 'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
-        'model_output': args.model_output,
+        'model_output': get_model_output_path(args.model_output, 'UnetPlusPlus', 'inceptionresnetv2'),
         'csv_output': args.csv_output,
         'sacred_runs': args.sacred_runs,
         'neptune_project': args.neptune_project,
@@ -447,7 +454,7 @@ if __name__ == '__main__':
                          'in_channels': 1},
         'image_path': args.image_path,
         'seg_path': args.seg_path,
-        'model_output': args.model_output,
+        'model_output': get_model_output_path(args.model_output, 'DeepLabV3Plus', 'efficientnet-b7'),
         'csv_output': args.csv_output,
         'sacred_runs': args.sacred_runs,
         'neptune_project': args.neptune_project,

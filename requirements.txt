@@ -1,6 +1,5 @@
 albumentations==2.0.8
 matplotlib==3.7.2
-MeshMetrics==0.2.1
 neptune==1.13.0
 nibabel==5.3.2
 nnunetv2==2.5.2
@@ -15,3 +14,4 @@ segmentation-models-pytorch==0.3.3
 torch==2.8.0
 torchvision==0.23.0
 tqdm==4.66.1
+git+https://github.com/gasperpodobnik/MeshMetrics.git
