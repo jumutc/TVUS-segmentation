@@ -205,17 +205,20 @@ def convert_to_nnunet_format(df, dataset_id, dataset_name, train_indices, val_in
         if img_slice.shape != seg_slice.shape:
             seg_slice = cv2.resize(seg_slice.astype(np.float32), (img_slice.shape[1], img_slice.shape[0]), interpolation=cv2.INTER_NEAREST)
         
-        # Convert to 3-channel RGB (nnUNet expects 3 channels for 2D)
+        # Keep as single-channel grayscale (nnUNet expects 1 channel for 2D)
         if len(img_slice.shape) == 2:
-            img_slice = np.repeat(img_slice[..., np.newaxis], 3, axis=-1)
-        assert img_slice.shape[2] == 3, f"Expected 3 channels (RGB), got {img_slice.shape[2]}"
+            img_slice = img_slice  # Already 2D, keep as is
+        elif len(img_slice.shape) == 3:
+            # If somehow 3D, take first channel to convert to grayscale
+            img_slice = img_slice[:, :, 0]
+        assert len(img_slice.shape) == 2, f"Expected 2D grayscale image, got shape {img_slice.shape}"
         
         # Binarize segmentation mask to exactly 0 and 1 (nnUNet requires labels to be 0, 1, 2, ...)
         # Do NOT multiply by 255 - nnUNet expects class indices, not pixel intensities
         seg_slice = (seg_slice > 0).astype(np.uint8)  # Values: 0 or 1
         
         # Verify dimensions match after all conversions
-        assert img_slice.shape[:2] == seg_slice.shape[:2], f"Image and mask dimensions still don't match: img={img_slice.shape[:2]}, mask={seg_slice.shape}"
+        assert img_slice.shape == seg_slice.shape, f"Image and mask dimensions still don't match: img={img_slice.shape}, mask={seg_slice.shape}"
         
         # Verify mask only contains 0 and 1
         unique_mask_values = np.unique(seg_slice)
@@ -224,16 +227,10 @@ def convert_to_nnunet_format(df, dataset_id, dataset_name, train_indices, val_in
         # Create unique identifier
         unique_id = f"{volume_id.replace('.nii.gz', '')}_{slice_idx:05d}"
         
-        # Save each RGB channel as a separate file (nnUNet expects separate channel files)
-        # Channel 0 (R)
+        # Save single-channel grayscale image (nnUNet expects separate channel files)
+        # Channel 0 (grayscale)
         img_filename_0 = f"{unique_id}_0000.png"
-        cv2.imwrite(os.path.join(imagesTr_path, img_filename_0), img_slice[:, :, 0])
-        # Channel 1 (G)
-        img_filename_1 = f"{unique_id}_0001.png"
-        cv2.imwrite(os.path.join(imagesTr_path, img_filename_1), img_slice[:, :, 1])
-        # Channel 2 (B)
-        img_filename_2 = f"{unique_id}_0002.png"
-        cv2.imwrite(os.path.join(imagesTr_path, img_filename_2), img_slice[:, :, 2])
+        cv2.imwrite(os.path.join(imagesTr_path, img_filename_0), img_slice)
         
         # Save mask as uint8 with values exactly 0 and 1 (class indices, not pixel intensities)
         mask_filename = f"{unique_id}.png"
@@ -252,9 +249,7 @@ def create_dataset_json(dataset_path, dataset_name, num_total_cases):
     """Create dataset.json file for nnUNet."""
     dataset_json = {
         "channel_names": {
-            "0": "R",
-            "1": "G",
-            "2": "B"
+            "0": "grayscale"
         },
         "labels": {
             "background": 0,
@@ -270,9 +265,7 @@ def create_dataset_json(dataset_path, dataset_name, num_total_cases):
         "release": "1.0",
         "tensorImageSize": "2D",
         "modality": {
-            "0": "RGB",
-            "1": "RGB",
-            "2": "RGB"
+            "0": "grayscale"
         },
         "dimension": 2
     }
