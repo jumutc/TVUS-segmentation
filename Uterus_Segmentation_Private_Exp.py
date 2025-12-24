@@ -87,10 +87,7 @@ class TVUSDataset(Dataset):
         img = self.X.loc[idx]['img']
         mask_1 = self.X.loc[idx]['seg']
 
-        # Ensure consistent dtype for OpenCV compatibility (float32 for albumentations)
-        img = img.astype(np.float32)
-
-        mask = np.zeros(list(mask_1.shape) + [1], dtype=np.float32)
+        mask = np.zeros(list(mask_1.shape) + [1])
         mask[mask_1 > 0, 0] = 1
 
         aug = self.transform(image=img, mask=mask)
@@ -368,13 +365,12 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, sacred_
         optimizer = torch.optim.Adam(model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
         augmentation_list = eval(get_augmentations())
+
         t_train = A.Compose(
             [A.Resize(height, width, interpolation=cv2.INTER_LINEAR), A.HorizontalFlip(), A.VerticalFlip()]
-            + augmentation_list
-            + [A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
+            + augmentation_list, is_check_shapes=False)
+        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_LINEAR)], is_check_shapes=False)
 
-        t_val = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_LINEAR),
-                           A.Normalize(normalization="min_max", p=1.0)], is_check_shapes=False)
         train_df = df.loc[X_train].reset_index()
         train_set = TVUSDataset(train_df, t_train)
         val_df = df.loc[X_val].reset_index()
