@@ -481,7 +481,6 @@ def run_experiment(_run, dataset_id, dataset_name, image_path, seg_path, csv_out
                 fold=0,  # Use fold 0 since we're using custom splits in splits_final.json
                 trainer_class_name='nnUNetTrainer',
                 num_gpus=1,
-                use_compressed_data=False,
                 export_validation_probabilities=False,
                 continue_training=False,
                 only_run_validation=False,
