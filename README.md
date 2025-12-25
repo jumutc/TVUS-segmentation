@@ -33,7 +33,7 @@ This repository implements multiple deep learning approaches for uterine segment
 
 ### Prerequisites
 
-- Python 3.9+ (tested with Python 3.9.21)
+- Python 3.9+ (tested with Python 3.9.21 and 3.10.19)
 - CUDA-capable GPU (recommended for training)
 - 16GB+ RAM (recommended)
 

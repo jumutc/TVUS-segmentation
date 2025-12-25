@@ -134,19 +134,6 @@ def create_df(image_path, seg_path):
             img_paths.append(img_path)
             seg_paths.append(seg_path_full)
             slice_indices.append(i)
-        
-        if not os.path.exists(seg_path):
-            continue
-            
-        nii_img = nib.load(image_path)
-        nii_img_data = nii_img.get_fdata()
-        
-        # Store paths and slice indices instead of loading all data
-        for i in range(nii_img_data.shape[-1]):
-            volume_ids.append(volume_id)
-            img_paths.append(image_path)
-            seg_paths.append(seg_path)
-            slice_indices.append(i)
 
     return pd.DataFrame({
         'volume_id': volume_ids,
