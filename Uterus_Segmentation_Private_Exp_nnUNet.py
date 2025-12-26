@@ -130,10 +130,10 @@ def create_df(image_path, seg_path):
         seg_masks = sorted(glob.glob(os.path.join(seg_path, volume_id, '*', 'masked_' + volume_id + '*')))
         preprocessed_paths = [find_in_paths(p, image_paths) for p in preprocessed_paths]
 
-        for image_path, seg_path in zip(preprocessed_paths, seg_masks):
+        for _image_path, _seg_path in zip(preprocessed_paths, seg_masks):
             volume_ids.append(volume_id)
-            img_paths.append(image_path)
-            seg_paths.append(seg_path)
+            img_paths.append(_image_path)
+            seg_paths.append(_seg_path)
 
     return pd.DataFrame({'volume_id': volume_ids, 'img_path': img_paths, 'seg_path': seg_paths},
                         index=np.arange(0, len(img_paths)))
@@ -144,6 +144,7 @@ def convert_to_nnunet_format(df, dataset_id, dataset_name, train_indices, val_in
     Convert images to nnUNet format and create dataset structure.
     nnUNet expects all images in imagesTr/labelsTr, validation is determined by splits.json.
     """
+    dataset_name_full = f"Dataset{dataset_id:03d}_{dataset_name}"
     dataset_path = os.path.join(os.environ['nnUNet_raw'], dataset_name_full)
     imagesTr_path = os.path.join(dataset_path, 'imagesTr')
     labelsTr_path = os.path.join(dataset_path, 'labelsTr')
@@ -286,7 +287,7 @@ def evaluate_predictions(dataset_id, dataset_name, val_cases, df, val_indices):
     results_path = os.path.join(
         os.environ['nnUNet_results'],
         f"Dataset{dataset_id:03d}_{dataset_name}",
-        'nnUNetTrainer__nnUNetPlans__2d',
+        'nnUNetTrainer_100epochs__nnUNetPlans__2d',
         'fold_0',
         'validation'
     )
@@ -472,7 +473,7 @@ def run_experiment(_run, dataset_id, dataset_name, image_path, seg_path, csv_out
                 dataset_name_or_id=fold_dataset_name,
                 configuration='2d',
                 fold=0,  # Use fold 0 since we're using custom splits in splits_final.json
-                trainer_class_name='nnUNetTrainer',
+                trainer_class_name='nnUNetTrainer_100epochs',
                 num_gpus=1,
                 export_validation_probabilities=False,
                 continue_training=False,

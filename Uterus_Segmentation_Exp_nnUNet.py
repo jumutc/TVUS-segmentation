@@ -289,7 +289,7 @@ def evaluate_predictions(dataset_id, dataset_name, val_cases, df, val_indices):
     results_path = os.path.join(
         os.environ['nnUNet_results'],
         f"Dataset{dataset_id:03d}_{dataset_name}",
-        'nnUNetTrainer__nnUNetPlans__2d',
+        'nnUNetTrainer_100epochs__nnUNetPlans__2d',
         'fold_0',
         'validation'
     )
@@ -479,7 +479,7 @@ def run_experiment(_run, dataset_id, dataset_name, image_path, seg_path, csv_out
                 dataset_name_or_id=fold_dataset_name,
                 configuration='2d',
                 fold=0,  # Use fold 0 since we're using custom splits in splits_final.json
-                trainer_class_name='nnUNetTrainer',
+                trainer_class_name='nnUNetTrainer_100epochs',
                 num_gpus=1,
                 export_validation_probabilities=False,
                 continue_training=False,
