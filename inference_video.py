@@ -7,6 +7,7 @@ from torchvision import transforms as T
 from tqdm import tqdm
 from pathlib import Path
 from skimage import measure
+import time
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -18,7 +19,7 @@ height, width = 512, 768
 def preprocess_frame(frame):
     """Preprocess a single frame for model inference"""
     # Resize to model input size
-    transform = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_NEAREST)], is_check_shapes=False)
+    transform = A.Compose([A.Resize(height, width, interpolation=cv2.INTER_LINEAR)], is_check_shapes=False)
     transformed = transform(image=frame)
     img = transformed['image']
     
@@ -94,7 +95,7 @@ def process_video(model, video_path, output_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
-        return
+        return None
     
     # Get video properties
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -111,6 +112,11 @@ def process_video(model, video_path, output_path):
     model.eval()
     frame_count = 0
     
+    # Lists to store timing statistics per frame
+    preprocessing_times = []
+    inference_times = []
+    postprocessing_times = []
+    
     with torch.no_grad():
         with tqdm(total=total_frames, desc="Processing frames") as pbar:
             while True:
@@ -119,18 +125,27 @@ def process_video(model, video_path, output_path):
                     break
                 
                 # Preprocess frame
+                preprocess_start = time.time()
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img_tensor, original_shape = preprocess_frame(frame)
                 img_tensor = img_tensor.unsqueeze(0).to(device)  # Add batch dimension
+                preprocessing_time = time.time() - preprocess_start
+                preprocessing_times.append(preprocessing_time)
                 
                 # Run inference
+                inference_start = time.time()
                 output = model(img_tensor)
+                inference_time = time.time() - inference_start
+                inference_times.append(inference_time)
                 
                 # Postprocess mask
+                postprocess_start = time.time()
                 mask = postprocess_mask(output, original_shape)
                 
                 # Draw contours on original frame
                 frame_with_contours = draw_contours(frame, mask)
+                postprocessing_time = time.time() - postprocess_start
+                postprocessing_times.append(postprocessing_time)
                 
                 # Write frame to output video
                 out.write(frame_with_contours)
@@ -143,6 +158,14 @@ def process_video(model, video_path, output_path):
     out.release()
     print(f"Saved output video to: {output_path}")
     print(f"Processed {frame_count} frames")
+    
+    # Return timing statistics for this video
+    return {
+        'preprocessing_times': preprocessing_times,
+        'inference_times': inference_times,
+        'postprocessing_times': postprocessing_times,
+        'frame_count': frame_count
+    }
 
 def get_video_files(input_path):
     """Get list of video files from a file or folder"""
@@ -173,6 +196,71 @@ def extract_model_name(model_path):
     """Extract model name from model path"""
     model_name = Path(model_path).stem  # Get filename without extension
     return model_name
+
+def print_statistics(all_preprocessing_times, all_inference_times, all_postprocessing_times, total_frames, total_videos):
+    """Print statistics over all frames and videos"""
+    print("\n" + "="*80)
+    print("TIMING STATISTICS")
+    print("="*80)
+    print(f"Total videos processed: {total_videos}")
+    print(f"Total frames processed: {total_frames}")
+    print("\nPer Frame Statistics:")
+    print("-"*80)
+    
+    # Preprocessing statistics
+    if all_preprocessing_times:
+        preprocess_mean = np.mean(all_preprocessing_times)
+        preprocess_std = np.std(all_preprocessing_times)
+        preprocess_min = np.min(all_preprocessing_times)
+        preprocess_max = np.max(all_preprocessing_times)
+        print(f"Preprocessing:")
+        print(f"  Mean: {preprocess_mean*1000:.3f} ms")
+        print(f"  Std:  {preprocess_std*1000:.3f} ms")
+        print(f"  Min:  {preprocess_min*1000:.3f} ms")
+        print(f"  Max:  {preprocess_max*1000:.3f} ms")
+        print(f"  Total: {np.sum(all_preprocessing_times):.3f} s")
+    
+    # Inference statistics
+    if all_inference_times:
+        inference_mean = np.mean(all_inference_times)
+        inference_std = np.std(all_inference_times)
+        inference_min = np.min(all_inference_times)
+        inference_max = np.max(all_inference_times)
+        print(f"\nModel Inference:")
+        print(f"  Mean: {inference_mean*1000:.3f} ms")
+        print(f"  Std:  {inference_std*1000:.3f} ms")
+        print(f"  Min:  {inference_min*1000:.3f} ms")
+        print(f"  Max:  {inference_max*1000:.3f} ms")
+        print(f"  Total: {np.sum(all_inference_times):.3f} s")
+    
+    # Postprocessing statistics
+    if all_postprocessing_times:
+        postprocess_mean = np.mean(all_postprocessing_times)
+        postprocess_std = np.std(all_postprocessing_times)
+        postprocess_min = np.min(all_postprocessing_times)
+        postprocess_max = np.max(all_postprocessing_times)
+        print(f"\nPostprocessing:")
+        print(f"  Mean: {postprocess_mean*1000:.3f} ms")
+        print(f"  Std:  {postprocess_std*1000:.3f} ms")
+        print(f"  Min:  {postprocess_min*1000:.3f} ms")
+        print(f"  Max:  {postprocess_max*1000:.3f} ms")
+        print(f"  Total: {np.sum(all_postprocessing_times):.3f} s")
+    
+    # Total per frame statistics
+    if all_preprocessing_times and all_inference_times and all_postprocessing_times:
+        total_times = [p + i + post for p, i, post in zip(all_preprocessing_times, all_inference_times, all_postprocessing_times)]
+        total_mean = np.mean(total_times)
+        total_std = np.std(total_times)
+        total_min = np.min(total_times)
+        total_max = np.max(total_times)
+        print(f"\nTotal per Frame (Preprocessing + Inference + Postprocessing):")
+        print(f"  Mean: {total_mean*1000:.3f} ms")
+        print(f"  Std:  {total_std*1000:.3f} ms")
+        print(f"  Min:  {total_min*1000:.3f} ms")
+        print(f"  Max:  {total_max*1000:.3f} ms")
+        print(f"  Total: {np.sum(total_times):.3f} s")
+    
+    print("="*80)
 
 def main():
     if len(sys.argv) < 3:
@@ -208,6 +296,13 @@ def main():
         print("No video files found to process")
         sys.exit(1)
     
+    # Aggregate timing statistics across all videos
+    all_preprocessing_times = []
+    all_inference_times = []
+    all_postprocessing_times = []
+    total_frames = 0
+    total_videos = 0
+    
     # Process each video
     for video_path in video_paths:
         # Create output filename: {original_name}_{model_name}_{postfix}.mp4
@@ -217,7 +312,18 @@ def main():
         output_filename = f"{base_name}_{model_name}_{postfix}{video_path_obj.suffix}"
         output_path = str(output_dir / output_filename)
         
-        process_video(model, video_path, output_path)
+        stats = process_video(model, video_path, output_path)
+        
+        if stats is not None:
+            # Aggregate statistics
+            all_preprocessing_times.extend(stats['preprocessing_times'])
+            all_inference_times.extend(stats['inference_times'])
+            all_postprocessing_times.extend(stats['postprocessing_times'])
+            total_frames += stats['frame_count']
+            total_videos += 1
+    
+    # Print aggregated statistics
+    print_statistics(all_preprocessing_times, all_inference_times, all_postprocessing_times, total_frames, total_videos)
     
     print("\nAll videos processed successfully!")
 
