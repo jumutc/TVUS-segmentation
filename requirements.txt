@@ -14,4 +14,5 @@ segmentation-models-pytorch==0.3.3
 torch==2.8.0
 torchvision==0.23.0
 tqdm==4.66.1
+plotly==6.5.0
 git+https://github.com/gasperpodobnik/MeshMetrics.git
