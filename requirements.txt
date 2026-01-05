@@ -15,4 +15,5 @@ torch==2.8.0
 torchvision==0.23.0
 tqdm==4.66.1
 plotly==6.5.0
+graphviz==0.21
 git+https://github.com/gasperpodobnik/MeshMetrics.git
