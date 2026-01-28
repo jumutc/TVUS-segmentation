@@ -1,6 +1,6 @@
-# Improving Transvaginal Ultrasound (TVUS) Image Acquisition with Real-Time AI-Powered Uterine Segmentation
+# Supporting Transvaginal Ultrasound (TVUS) Image Analysis with Real-Time AI-Powered Uterine Segmentation
 
-This repository contains the implementation for **"Improving Transvaginal Ultrasound (TVUS) Image Acquisition with Real-Time AI-Powered Uterine Segmentation"** paper, providing deep learning models and tools for automated segmentation of uterine structures in ultrasound images.
+This repository contains the implementation for **"Supporting Transvaginal Ultrasound (TVUS) Image Analysis with Real-Time AI-Powered Uterine Segmentation"** paper, providing deep learning models and tools for automated segmentation of uterine structures in ultrasound images.
 
 ## Overview
 
