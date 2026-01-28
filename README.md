@@ -314,11 +314,11 @@ Results are logged to:
 If you use this code in your research, please cite:
 
 ```bibtex
-@article{your_paper_2024,
-  title={AI-Powered Uterine Segmentation in 2D and 3D TVUS: A Multi-Group Study},
-  author={Your Name},
+@article{your_paper_2026,
+  title={Supporting Transvaginal Ultrasound (TVUS) Image Analysis with Real-Time AI-Powered Uterine Segmentation},
+  author={Schor et al.},
   journal={Journal Name},
-  year={2024}
+  year={2026}
 }
 ```
 
