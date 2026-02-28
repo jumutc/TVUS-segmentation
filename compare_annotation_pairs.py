@@ -1,4 +1,5 @@
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -160,10 +161,58 @@ def compute_segmentation_metrics(mask1, mask2, spacing=(1, 1)):
     }
 
 
+def _sanitize_path_component(name):
+    """Replace disallowed characters for use in directory/file names."""
+    return re.sub(r'[^\w\-.]', '_', name)
+
+
+def _save_masks_to_tmp(mask1, mask2, file1_path, file2_path, folder_path, pair_idx, tmp_dir):
+    """Save extracted masks as PNG images to tmp_dir."""
+    tmp_dir = Path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    
+    stem1 = Path(file1_path).stem
+    stem2 = Path(file2_path).stem
+    folder_name = Path(folder_path).name
+    
+    if stem1 == stem2:
+        subdir_name = f"{pair_idx:03d}_{_sanitize_path_component(stem1)}"
+    else:
+        subdir_name = f"{pair_idx:03d}_{_sanitize_path_component(folder_name)}_{_sanitize_path_component(stem1)}_vs_{_sanitize_path_component(stem2)}"
+    
+    pair_dir = tmp_dir / subdir_name
+    pair_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save as uint8 (0/255) PNG
+    mask1_uint8 = (mask1.astype(np.uint8) * 255)
+    mask2_uint8 = (mask2.astype(np.uint8) * 255)
+    
+    path1 = pair_dir / f"mask1_{Path(file1_path).name}"
+    path2 = pair_dir / f"mask2_{Path(file2_path).name}"
+    
+    cv2.imwrite(str(path1), mask1_uint8)
+    cv2.imwrite(str(path2), mask2_uint8)
+    
+    return str(pair_dir)
+
+
+def _collect_annotation_files(folder_path, image_extensions):
+    """Collect annotation image files from a folder, excluding masked_ prefix."""
+    annotation_files = []
+    for ext in image_extensions:
+        annotation_files.extend(folder_path.glob(ext))
+    annotation_files = [f for f in annotation_files
+                       if not f.name.startswith('masked_')]
+    return sorted(annotation_files)
+
+
 def find_annotation_pairs(parent_folder):
     """
     Find pairs of annotation files in subfolders of the parent folder.
-    Assumes each subfolder contains exactly 2 annotation images.
+    Supports two layouts:
+    1) Per-subfolder pairs: each subfolder contains exactly 2 annotation images.
+    2) Two-expert layout: exactly 2 subfolders, each with all annotations from one
+       expert; pairs are formed by matching filenames between the two subfolders.
     
     Args:
         parent_folder: Path to parent folder containing subfolders with annotation pairs
@@ -179,23 +228,38 @@ def find_annotation_pairs(parent_folder):
     image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif',
                         '*.JPG', '*.JPEG', '*.PNG', '*.BMP', '*.TIFF', '*.TIF']
     
-    pairs = []
+    subfolders = [d for d in sorted(parent_path.iterdir()) if d.is_dir()]
     
-    # Iterate through subfolders
-    for subfolder in sorted(parent_path.iterdir()):
-        if not subfolder.is_dir():
-            continue
+    # Layout 2: exactly 2 subfolders - match files by filename between experts
+    if len(subfolders) == 2:
+        folder1, folder2 = subfolders[0], subfolders[1]
+        files1 = _collect_annotation_files(folder1, image_extensions)
+        files2 = _collect_annotation_files(folder2, image_extensions)
         
-        # Find all image files in this subfolder
-        annotation_files = []
-        for ext in image_extensions:
-            annotation_files.extend(subfolder.glob(ext))
+        # Build filename -> path maps for matching
+        by_name1 = {f.name: f for f in files1}
+        by_name2 = {f.name: f for f in files2}
         
-        # Filter out files starting with 'masked_' if needed (optional)
-        annotation_files = [f for f in annotation_files 
-                          if not f.name.startswith('masked_')]
-        
-        annotation_files = sorted(annotation_files)
+        common_names = set(by_name1.keys()) & set(by_name2.keys())
+        if common_names:
+            # Use parent folder as the logical "folder" for this layout
+            pairs = [
+                (str(parent_path), str(by_name1[name]), str(by_name2[name]))
+                for name in sorted(common_names)
+            ]
+            if len(by_name1) != len(by_name2) or len(common_names) != len(by_name1):
+                only_in_1 = set(by_name1.keys()) - common_names
+                only_in_2 = set(by_name2.keys()) - common_names
+                if only_in_1:
+                    print(f"Warning: Files only in {folder1.name}: {sorted(only_in_1)}")
+                if only_in_2:
+                    print(f"Warning: Files only in {folder2.name}: {sorted(only_in_2)}")
+            return pairs
+    
+    # Layout 1: each subfolder has 2 files
+    pairs = []
+    for subfolder in subfolders:
+        annotation_files = _collect_annotation_files(subfolder, image_extensions)
         
         if len(annotation_files) == 2:
             pairs.append((str(subfolder), str(annotation_files[0]), str(annotation_files[1])))
@@ -203,7 +267,6 @@ def find_annotation_pairs(parent_folder):
             print(f"Warning: Found {len(annotation_files)} files in {subfolder}, expected 2. Skipping.")
         elif len(annotation_files) == 1:
             print(f"Warning: Found only 1 file in {subfolder}, expected 2. Skipping.")
-        # If 0 files, silently skip
     
     return pairs
 
@@ -229,6 +292,25 @@ def main():
         default=True,
         help='Print detailed information for each pair'
     )
+    parser.add_argument(
+        '--save-masks',
+        action='store_true',
+        dest='save_masks',
+        help='Save extracted masks to tmp folder'
+    )
+    parser.add_argument(
+        '--no-save-masks',
+        action='store_false',
+        dest='save_masks',
+        help='Do not save masks to tmp folder'
+    )
+    parser.set_defaults(save_masks=True)
+    parser.add_argument(
+        '--tmp_dir',
+        type=str,
+        default=None,
+        help='Directory for saved masks (default: tmp/compare_annotation_masks)'
+    )
     
     args = parser.parse_args()
     
@@ -242,11 +324,16 @@ def main():
     
     print(f"Found {len(pairs)} annotation pair(s)")
     
+    tmp_dir = Path(args.tmp_dir) if args.tmp_dir else Path("tmp") / "compare_annotation_masks"
+    if args.save_masks:
+        tmp_dir = Path(tmp_dir).resolve()
+        print(f"Masks will be saved to: {tmp_dir}")
+    
     # Process each pair
     all_metrics = []
     results = []
     
-    for folder_path, file1_path, file2_path in pairs:
+    for pair_idx, (folder_path, file1_path, file2_path) in enumerate(pairs):
         try:
             if args.verbose:
                 print(f"\nProcessing pair in {folder_path}:")
@@ -256,6 +343,15 @@ def main():
             # Extract masks from annotations
             mask1 = extract_mask_from_annotation(file1_path)
             mask2 = extract_mask_from_annotation(file2_path)
+            
+            # Save masks to tmp if requested
+            if args.save_masks:
+                saved_dir = _save_masks_to_tmp(
+                    mask1, mask2, file1_path, file2_path,
+                    folder_path, pair_idx, tmp_dir
+                )
+                if args.verbose:
+                    print(f"  Masks saved to: {saved_dir}")
             
             if args.verbose:
                 print(f"  Mask 1 shape: {mask1.shape}, pixels: {np.sum(mask1)}")
