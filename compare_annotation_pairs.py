@@ -276,7 +276,7 @@ def main():
         description='Compare annotation pairs using red border detection and segmentation metrics'
     )
     parser.add_argument(
-        '--parent_folder',
+        '--parent-folder',
         type=str,
         help='Path to parent folder containing subfolders with annotation pairs'
     )
