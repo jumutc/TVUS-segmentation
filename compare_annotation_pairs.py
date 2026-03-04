@@ -306,7 +306,7 @@ def main():
     )
     parser.set_defaults(save_masks=True)
     parser.add_argument(
-        '--tmp_dir',
+        '--tmp-dir',
         type=str,
         default=None,
         help='Directory for saved masks (default: tmp/compare_annotation_masks)'
