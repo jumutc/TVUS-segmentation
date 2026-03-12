@@ -151,7 +151,7 @@ def compute_segmentation_metrics(mask1, mask2, spacing=(1, 1)):
     
     # Compute metrics
     iou = metrics.iou()
-    nsd = metrics.nsd(6)
+    nsd = metrics.nsd(10)
     dice = metrics.dsc()
     
     return {
@@ -164,6 +164,31 @@ def compute_segmentation_metrics(mask1, mask2, spacing=(1, 1)):
 def _sanitize_path_component(name):
     """Replace disallowed characters for use in directory/file names."""
     return re.sub(r'[^\w\-.]', '_', name)
+
+
+def load_blacklist(parent_folder, filename='blacklist.txt'):
+    """
+    Load a blacklist of filenames from a TXT file in the parent folder.
+    One filename per line; empty lines and lines starting with # are ignored.
+
+    Args:
+        parent_folder: Path to parent folder containing the blacklist file
+        filename: Name of the blacklist file (default: blacklist.txt)
+
+    Returns:
+        Set of blacklisted filenames (empty set if file does not exist)
+    """
+    blacklist_path = Path(parent_folder) / filename
+    if not blacklist_path.exists():
+        return set()
+
+    blacklist = set()
+    with open(blacklist_path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                blacklist.add(line)
+    return blacklist
 
 
 def _save_masks_to_tmp(mask1, mask2, file1_path, file2_path, folder_path, pair_idx, tmp_dir):
@@ -213,10 +238,13 @@ def find_annotation_pairs(parent_folder):
     1) Per-subfolder pairs: each subfolder contains exactly 2 annotation images.
     2) Two-expert layout: exactly 2 subfolders, each with all annotations from one
        expert; pairs are formed by matching filenames between the two subfolders.
-    
+
+    Pairs involving blacklisted filenames (from parent_folder/blacklist.txt) are
+    filtered out in main(), not here.
+
     Args:
         parent_folder: Path to parent folder containing subfolders with annotation pairs
-    
+
     Returns:
         List of tuples: [(folder_path, file1_path, file2_path), ...]
     """
@@ -278,6 +306,7 @@ def main():
     parser.add_argument(
         '--parent-folder',
         type=str,
+        required=True,
         help='Path to parent folder containing subfolders with annotation pairs'
     )
     parser.add_argument(
@@ -320,6 +349,24 @@ def main():
     
     if len(pairs) == 0:
         print("No annotation pairs found!")
+        sys.exit(1)
+    
+    # Load blacklist and filter pairs
+    blacklist = load_blacklist(args.parent_folder)
+    if blacklist:
+        print(f"Blacklist loaded: {len(blacklist)} file(s) excluded from comparison")
+        original_count = len(pairs)
+        pairs = [
+            (folder_path, f1, f2)
+            for folder_path, f1, f2 in pairs
+            if Path(f1).name not in blacklist and Path(f2).name not in blacklist
+        ]
+        skipped = original_count - len(pairs)
+        if skipped:
+            print(f"Skipped {skipped} pair(s) due to blacklist")
+    
+    if len(pairs) == 0:
+        print("No annotation pairs remaining after applying blacklist!")
         sys.exit(1)
     
     print(f"Found {len(pairs)} annotation pair(s)")
