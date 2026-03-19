@@ -1,3 +1,4 @@
+import os.path
 import sys
 import cv2
 import numpy as np
@@ -272,7 +273,10 @@ def main():
     
     model_path = sys.argv[1]
     input_path = sys.argv[2]
-    postfix = sys.argv[3] if len(sys.argv) > 3 else "segmented"
+    output_dir = sys.argv[3] if len(sys.argv) > 3 else "segmented"
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     
     # Extract model name
     model_name = extract_model_name(model_path)
@@ -308,9 +312,9 @@ def main():
         # Create output filename: {original_name}_{model_name}_{postfix}.mp4
         video_path_obj = Path(video_path)
         base_name = video_path_obj.stem
-        output_dir = video_path_obj.parent
-        output_filename = f"{base_name}_{model_name}_{postfix}{video_path_obj.suffix}"
-        output_path = str(output_dir / output_filename)
+        # output_dir = video_path_obj.parent
+        output_filename = f"{base_name}_{model_name}{video_path_obj.suffix}"
+        output_path = f"{output_dir}/{output_filename}"
         
         stats = process_video(model, video_path, output_path)
         
