@@ -1,6 +1,6 @@
-# Supporting Transvaginal Ultrasound (TVUS) Image Analysis with Real-Time AI-Powered Uterine Segmentation
+# Real-Time AI Uterus Segmentation in TVUS
 
-This repository contains the implementation for **"Supporting Transvaginal Ultrasound (TVUS) Image Analysis with Real-Time AI-Powered Uterine Segmentation"** paper, providing deep learning models and tools for automated segmentation of uterine structures in ultrasound images.
+This repository contains the implementation for **"Real-Time Automatic Uterus Segmentation in Transvaginal Ultrasound scans: A Feasibility Study"** paper, providing deep learning models and tools for automated segmentation of uterine structures in ultrasound images.
 
 ## Overview
 
@@ -312,7 +312,9 @@ Results are logged to:
 
 ## TVUS videos with annotations
 
-An example of annotated TVUS video by DeepLabV3+ model with EfficientNet-B7 encoder can be found [here](https://rtucloud1-my.sharepoint.com/:v:/g/personal/vilens_jumutcs_rtu_lv/IQDjFsv8MLEfTKE7nQjynXMxATWp0D9YYv3KZ9QqS5qJdcw?nav=eyJyZWZlcnJhbEluZm8iOnsicmVmZXJyYWxBcHAiOiJPbmVEcml2ZUZvckJ1c2luZXNzIiwicmVmZXJyYWxBcHBQbGF0Zm9ybSI6IldlYiIsInJlZmVycmFsTW9kZSI6InZpZXciLCJyZWZlcnJhbFZpZXciOiJNeUZpbGVzTGlua0NvcHkifX0&e=nf0Y3g)
+An example of annotated TVUS video by DeepLabV3+ model with EfficientNet-B7 encoder can be found below and [here](https://rtucloud1-my.sharepoint.com/:v:/g/personal/vilens_jumutcs_rtu_lv/IQDjFsv8MLEfTKE7nQjynXMxATWp0D9YYv3KZ9QqS5qJdcw?nav=eyJyZWZlcnJhbEluZm8iOnsicmVmZXJyYWxBcHAiOiJPbmVEcml2ZUZvckJ1c2luZXNzIiwicmVmZXJyYWxBcHBQbGF0Zm9ybSI6IldlYiIsInJlZmVycmFsTW9kZSI6InZpZXciLCJyZWZlcnJhbFZpZXciOiJNeUZpbGVzTGlua0NvcHkifX0&e=nf0Y3g)
+
+![ezgif-7125288ff7d6dcc3](https://github.com/user-attachments/assets/f4d1dc98-a829-44f2-90e7-69f6a654ce53)
 
 ## Citation
 
