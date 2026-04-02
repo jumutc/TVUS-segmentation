@@ -2,6 +2,8 @@
 
 This repository contains the implementation for **"Real-Time Automatic Uterus Segmentation in Transvaginal Ultrasound scans: A Feasibility Study"** paper, providing deep learning models and tools for automated segmentation of uterine structures in ultrasound images.
 
+![ezgif-7125288ff7d6dcc3](https://github.com/user-attachments/assets/f4d1dc98-a829-44f2-90e7-69f6a654ce53)
+
 ## Overview
 
 Transvaginal Ultrasound (TVUS) is a critical imaging modality used in gynecological examinations for diagnosing various uterine conditions. Accurate segmentation of uterine structures is essential for:
@@ -312,9 +314,7 @@ Results are logged to:
 
 ## TVUS videos with annotations
 
-An example of annotated TVUS video by DeepLabV3+ model with EfficientNet-B7 encoder can be found below and [here](https://rtucloud1-my.sharepoint.com/:v:/g/personal/vilens_jumutcs_rtu_lv/IQDjFsv8MLEfTKE7nQjynXMxATWp0D9YYv3KZ9QqS5qJdcw?nav=eyJyZWZlcnJhbEluZm8iOnsicmVmZXJyYWxBcHAiOiJPbmVEcml2ZUZvckJ1c2luZXNzIiwicmVmZXJyYWxBcHBQbGF0Zm9ybSI6IldlYiIsInJlZmVycmFsTW9kZSI6InZpZXciLCJyZWZlcnJhbFZpZXciOiJNeUZpbGVzTGlua0NvcHkifX0&e=nf0Y3g)
-
-![ezgif-7125288ff7d6dcc3](https://github.com/user-attachments/assets/f4d1dc98-a829-44f2-90e7-69f6a654ce53)
+An example of the above annotated TVUS video by DeepLabV3+ model with EfficientNet-B7 encoder can be found [here](https://rtucloud1-my.sharepoint.com/:v:/g/personal/vilens_jumutcs_rtu_lv/IQDjFsv8MLEfTKE7nQjynXMxATWp0D9YYv3KZ9QqS5qJdcw?nav=eyJyZWZlcnJhbEluZm8iOnsicmVmZXJyYWxBcHAiOiJPbmVEcml2ZUZvckJ1c2luZXNzIiwicmVmZXJyYWxBcHBQbGF0Zm9ybSI6IldlYiIsInJlZmVycmFsTW9kZSI6InZpZXciLCJyZWZlcnJhbFZpZXciOiJNeUZpbGVzTGlua0NvcHkifX0&e=nf0Y3g)
 
 ## Citation
 
