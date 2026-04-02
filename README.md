@@ -309,6 +309,11 @@ Results are logged to:
 - Sacred for local experiment management
 - Console output with detailed metrics
 
+
+## TVUS videos with annotations
+
+An example of annotated TVUS video by DeepLabV3+ model with EfficientNet-B7 encoder can be found [here](https://rtucloud1-my.sharepoint.com/:v:/g/personal/vilens_jumutcs_rtu_lv/IQDjFsv8MLEfTKE7nQjynXMxATWp0D9YYv3KZ9QqS5qJdcw?nav=eyJyZWZlcnJhbEluZm8iOnsicmVmZXJyYWxBcHAiOiJPbmVEcml2ZUZvckJ1c2luZXNzIiwicmVmZXJyYWxBcHBQbGF0Zm9ybSI6IldlYiIsInJlZmVycmFsTW9kZSI6InZpZXciLCJyZWZlcnJhbFZpZXciOiJNeUZpbGVzTGlua0NvcHkifX0&e=nf0Y3g)
+
 ## Citation
 
 If you use this code in your research, please cite:
