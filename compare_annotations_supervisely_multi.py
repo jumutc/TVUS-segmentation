@@ -49,6 +49,104 @@ def load_blacklist(parent_folder, filename='blacklist.txt'):
     return blacklist
 
 
+def _parse_excluded_sample_ids(values):
+    """Parse CLI exclude values; supports repeated args and comma-separated IDs."""
+    excluded = set()
+    for value in values or []:
+        for part in value.split(','):
+            sample_id = part.strip()
+            if sample_id:
+                excluded.add(sample_id)
+    return excluded
+
+
+def load_excluded_sample_ids_from_file(file_path):
+    """Load sample IDs from a text file (one per line; # comments ignored)."""
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Exclude file not found: {path}")
+
+    excluded = set()
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                excluded.add(line)
+    return excluded
+
+
+def resolve_excluded_sample_ids(
+    parent_folder,
+    exclude_ids=None,
+    exclude_file=None,
+    blacklist_filename='blacklist.txt',
+):
+    """
+    Resolve excluded sample IDs.
+
+    Uses explicit IDs from --exclude / --exclude-file when provided.
+    Otherwise falls back to blacklist.txt in the parent folder.
+    """
+    explicit_ids = _parse_excluded_sample_ids(exclude_ids)
+    if exclude_file:
+        explicit_ids.update(load_excluded_sample_ids_from_file(exclude_file))
+
+    if explicit_ids:
+        return explicit_ids, 'explicit'
+
+    blacklist = load_blacklist(parent_folder, filename=blacklist_filename)
+    if blacklist:
+        return blacklist, 'blacklist'
+
+    return set(), None
+
+
+def _group_sample_identifiers(group):
+    """All identifiers that can match an excluded sample ID for a group."""
+    video_name = group['video_name']
+    video_path = Path(video_name)
+    stem = video_path.stem
+    study = video_stem_to_study_number(stem)
+
+    identifiers = {
+        video_name,
+        video_path.name,
+        stem,
+        study,
+        f"{video_path.name}.json",
+        group['group_name'],
+    }
+    if '#' in group['group_name']:
+        identifiers.add(group['group_name'].split('#', 1)[0])
+    return identifiers
+
+
+def filter_groups_by_excluded_samples(groups, excluded_ids):
+    """
+    Remove groups whose sample identifiers overlap excluded_ids.
+
+    Returns:
+        (kept_groups, excluded_groups) where excluded_groups is a list of
+        dicts with keys group_name, video_name, matched_ids.
+    """
+    if not excluded_ids:
+        return groups, []
+
+    kept = []
+    excluded_groups = []
+    for group in groups:
+        matched_ids = sorted(_group_sample_identifiers(group) & excluded_ids)
+        if matched_ids:
+            excluded_groups.append({
+                'group_name': group['group_name'],
+                'video_name': group['video_name'],
+                'matched_ids': matched_ids,
+            })
+        else:
+            kept.append(group)
+    return kept, excluded_groups
+
+
 def video_stem_to_study_number(video_stem):
     """
     Map a video filename stem to the Study number used in frame_measurements.csv.
@@ -600,6 +698,22 @@ def main():
         help='CSV with per-study NSD tau in the "Pixels 1 mm" column '
              '(default: frame_measurements.csv in parent folder)',
     )
+    parser.add_argument(
+        '--exclude', action='append', default=[],
+        help='Sample ID(s) to exclude. Repeat or pass comma-separated values. '
+             'Matches video filename, stem, study number, or group name. '
+             'When provided, blacklist.txt is not used.',
+    )
+    parser.add_argument(
+        '--exclude-file', type=str, default=None,
+        help='Text file listing sample IDs to exclude (one per line; '
+             '# comments ignored). When provided, blacklist.txt is not used.',
+    )
+    parser.add_argument(
+        '--blacklist', type=str, default='blacklist.txt',
+        help='Blacklist filename used as fallback when --exclude and '
+             '--exclude-file are not provided (default: blacklist.txt)',
+    )
 
     args = parser.parse_args()
 
@@ -619,21 +733,48 @@ def main():
         print("No annotation groups found!")
         sys.exit(1)
 
-    blacklist = load_blacklist(args.parent_folder)
-    if blacklist:
-        print(f"Blacklist loaded: {len(blacklist)} file(s) excluded")
-        original_count = len(groups)
-        groups = [
-            g for g in groups
-            if Path(g['video_name']).name not in blacklist
-            and f"{Path(g['video_name']).name}.json" not in blacklist
-        ]
-        skipped = original_count - len(groups)
-        if skipped:
-            print(f"Skipped {skipped} group(s) due to blacklist")
+    excluded_ids, exclusion_source = resolve_excluded_sample_ids(
+        args.parent_folder,
+        exclude_ids=args.exclude,
+        exclude_file=args.exclude_file,
+        blacklist_filename=args.blacklist,
+    )
+    if excluded_ids:
+        source_label = (
+            'explicit exclusion list'
+            if exclusion_source == 'explicit'
+            else f'blacklist ({args.blacklist})'
+        )
+        print(
+            f"Exclusion source: {source_label} "
+            f"({len(excluded_ids)} sample ID(s))"
+        )
+        groups, excluded_groups = filter_groups_by_excluded_samples(
+            groups, excluded_ids,
+        )
+        if excluded_groups:
+            print(f"Skipped {len(excluded_groups)} group(s):")
+            for item in excluded_groups:
+                matched = ', '.join(item['matched_ids'])
+                print(
+                    f"  - {item['group_name']} "
+                    f"(matched: {matched})"
+                )
+        unmatched_ids = sorted(
+            excluded_ids - {
+                matched_id
+                for item in excluded_groups
+                for matched_id in item['matched_ids']
+            }
+        )
+        if unmatched_ids:
+            print(
+                "Warning: exclusion ID(s) did not match any group: "
+                + ', '.join(unmatched_ids)
+            )
 
     if not groups:
-        print("No annotation groups remaining after applying blacklist!")
+        print("No annotation groups remaining after applying exclusions!")
         sys.exit(1)
 
     total_entries = sum(len(g['entries']) for g in groups)
