@@ -209,7 +209,7 @@ def load_supervisely_annotation(annotation_path):
 
 
 def _is_niche_class(class_title):
-    return (class_title or '').lower() in NICHE_CLASS_NAMES
+    return (class_title or '').lower() in NICHE_CLASS_NAMES or any([n in class_title.lower() for n in NICHE_CLASS_NAMES])
 
 
 def get_niche_object_keys(annotation):

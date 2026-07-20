@@ -1,5 +1,6 @@
 albumentations==2.0.8
 matplotlib==3.7.2
+monai==1.5.2
 neptune==1.13.0
 nibabel==5.3.2
 nnunetv2==2.6.2
