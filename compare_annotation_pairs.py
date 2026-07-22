@@ -122,7 +122,7 @@ def extract_mask_from_annotation(annotation_path):
     return mask
 
 
-def compute_segmentation_metrics(mask1, mask2, spacing=(1, 1)):
+def compute_segmentation_metrics(mask1, mask2, spacing=(1, 1), nsd_tau=10):
     """
     Compute segmentation metrics between two binary masks.
     
@@ -130,6 +130,7 @@ def compute_segmentation_metrics(mask1, mask2, spacing=(1, 1)):
         mask1: First binary mask (numpy array of bool)
         mask2: Second binary mask (numpy array of bool)
         spacing: Spacing for distance metrics (default: (1, 1))
+        nsd_tau: NSD tolerance in pixels (default: 10)
     
     Returns:
         Dictionary with metrics: 'iou', 'nsd', 'dice'
@@ -151,7 +152,7 @@ def compute_segmentation_metrics(mask1, mask2, spacing=(1, 1)):
     
     # Compute metrics
     iou = metrics.iou()
-    nsd = metrics.nsd(10)
+    nsd = metrics.nsd(nsd_tau)
     dice = metrics.dsc()
     
     return {
@@ -166,29 +167,183 @@ def _sanitize_path_component(name):
     return re.sub(r'[^\w\-.]', '_', name)
 
 
+def _strip_annotation_suffix(stem):
+    """Remove trailing _sag_var / _sag / _var from an annotation stem."""
+    name = stem
+    for suffix in ('_sag_var', '_sag', '_var'):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def annotation_stem_to_study_number(annotation_stem):
+    """
+    Map an annotation filename stem to the Study number in video_measurements.csv.
+
+    Examples:
+      VU0800_sag_var     -> VU0800
+      VU1000_1_sag_var   -> VU1000_1
+      VU0864_2_sag_var   -> VU0864_2
+      VU01001_sag_var    -> VU1001
+    """
+    name = _strip_annotation_suffix(annotation_stem)
+    # Fix accidental leading zero in 5-digit IDs (VU01001 -> VU1001)
+    name = re.sub(r'^VU0(\d{4})$', r'VU\1', name)
+    return name
+
+
+def load_video_measurements(parent_folder, filename='video_measurements.csv'):
+    """
+    Load per-study NSD tolerance (tau) from video_measurements.csv.
+
+    Returns:
+        Dict mapping study number -> tau (Pixels 1 mm column value)
+    """
+    csv_path = Path(parent_folder) / filename
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Video measurements CSV not found: {csv_path}"
+        )
+
+    df = pd.read_csv(csv_path)
+    if 'Study number' not in df.columns or 'Pixels 1 mm' not in df.columns:
+        raise ValueError(
+            f"{csv_path} must contain 'Study number' and 'Pixels 1 mm' columns"
+        )
+
+    measurements = {}
+    for _, row in df.iterrows():
+        study = str(row['Study number']).strip()
+        tau = row['Pixels 1 mm']
+        if pd.isna(tau):
+            print(f"Warning: missing Pixels 1 mm for study {study}, skipping row")
+            continue
+        measurements[study] = float(tau)
+    return measurements
+
+
+def get_nsd_tau_for_annotation(annotation_name, measurements):
+    """
+    Resolve NSD tau for an annotation filename via its Study number.
+
+    Tries the mapped study number first; if missing, falls back to the base
+    ID without a trailing _N suffix (e.g. VU0864_2 -> VU0864).
+    """
+    stem = Path(annotation_name).stem
+    study = annotation_stem_to_study_number(stem)
+    if study in measurements:
+        return measurements[study], study
+
+    base_study = re.sub(r'_\d+$', '', study)
+    if base_study != study and base_study in measurements:
+        return measurements[base_study], base_study
+
+    raise KeyError(
+        f"No Pixels 1 mm entry for annotation {annotation_name} "
+        f"(study number {study})"
+    )
+
+
+def _annotation_identifiers(annotation_name, measurements=None):
+    """
+    Identifiers that can match a blacklist entry for an annotation file.
+
+    Includes full filename, stem, raw/normalized study IDs, and (when
+    measurements are available) the resolved Study number used for NSD tau.
+    """
+    path = Path(annotation_name)
+    name = path.name
+    stem = path.stem
+    raw_id = _strip_annotation_suffix(stem)
+    study = annotation_stem_to_study_number(stem)
+
+    identifiers = {name, stem, raw_id, study}
+
+    if measurements is not None:
+        try:
+            _, resolved_study = get_nsd_tau_for_annotation(name, measurements)
+            identifiers.add(resolved_study)
+        except KeyError:
+            pass
+    else:
+        base_study = re.sub(r'_\d+$', '', study)
+        if base_study != study:
+            identifiers.add(base_study)
+
+    return identifiers
+
+
+def _expand_blacklist_entry(entry):
+    """Expand a blacklist line into matchable filename / stem / study ID forms."""
+    path = Path(entry)
+    expanded = {entry, path.name, path.stem}
+    expanded.add(annotation_stem_to_study_number(path.stem))
+    expanded.add(annotation_stem_to_study_number(entry))
+    expanded.add(_strip_annotation_suffix(path.stem))
+    return {value for value in expanded if value}
+
+
 def load_blacklist(parent_folder, filename='blacklist.txt'):
     """
-    Load a blacklist of filenames from a TXT file in the parent folder.
-    One filename per line; empty lines and lines starting with # are ignored.
+    Load a blacklist from a TXT file in the parent folder.
+
+    Each non-empty, non-# line may be a full filename (e.g. VU0866_sag_var.png)
+    or a study / sample ID (e.g. VU0866, VU1000_1).
 
     Args:
         parent_folder: Path to parent folder containing the blacklist file
         filename: Name of the blacklist file (default: blacklist.txt)
 
     Returns:
-        Set of blacklisted filenames (empty set if file does not exist)
+        (raw_entries, match_set) where raw_entries preserves the original lines
+        and match_set contains all expanded forms used for matching. Both are
+        empty if the file does not exist.
     """
     blacklist_path = Path(parent_folder) / filename
     if not blacklist_path.exists():
-        return set()
+        return [], set()
 
-    blacklist = set()
+    raw_entries = []
+    match_set = set()
     with open(blacklist_path, encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith('#'):
-                blacklist.add(line)
-    return blacklist
+                raw_entries.append(line)
+                match_set.update(_expand_blacklist_entry(line))
+    return raw_entries, match_set
+
+
+def filter_pairs_by_blacklist(pairs, blacklist_match_set, measurements=None):
+    """
+    Remove pairs whose annotation identifiers overlap the blacklist.
+
+    Returns:
+        (kept_pairs, excluded_pairs) where excluded_pairs is a list of dicts
+        with keys file1, file2, matched_ids.
+    """
+    if not blacklist_match_set:
+        return pairs, []
+
+    kept = []
+    excluded = []
+    for folder_path, file1, file2 in pairs:
+        matched = sorted(
+            (
+                _annotation_identifiers(file1, measurements)
+                | _annotation_identifiers(file2, measurements)
+            )
+            & blacklist_match_set
+        )
+        if matched:
+            excluded.append({
+                'file1': Path(file1).name,
+                'file2': Path(file2).name,
+                'matched_ids': matched,
+            })
+        else:
+            kept.append((folder_path, file1, file2))
+    return kept, excluded
 
 
 def _save_masks_to_tmp(mask1, mask2, file1_path, file2_path, folder_path, pair_idx, tmp_dir):
@@ -231,6 +386,107 @@ def _collect_annotation_files(folder_path, image_extensions):
     return sorted(annotation_files)
 
 
+def _annotators_from_pair(file1_path, file2_path):
+    """
+    Resolve annotator labels for a compared pair.
+
+    Prefer parent-folder names (two-expert layout). If both files share a
+    folder (per-subfolder layout), fall back to the file stems when they differ.
+    """
+    path1 = Path(file1_path)
+    path2 = Path(file2_path)
+    annotator_a = path1.parent.name
+    annotator_b = path2.parent.name
+
+    if annotator_a == annotator_b:
+        stem_a, stem_b = path1.stem, path2.stem
+        if stem_a != stem_b:
+            annotator_a, annotator_b = stem_a, stem_b
+
+    return annotator_a, annotator_b, f"{annotator_a} vs {annotator_b}"
+
+
+def _normalize_annotator_pair(annotator_a, annotator_b):
+    if annotator_a <= annotator_b:
+        return annotator_a, annotator_b
+    return annotator_b, annotator_a
+
+
+def build_average_results(results_df, include_total=False):
+    """
+    Build per-annotator-pair summary with mean and std per metric.
+
+    When include_total is True, also append a TOTAL row aggregated over all
+    rows in results_df (i.e. whatever is in that results file).
+    """
+    metric_cols = ['iou', 'nsd', 'dice']
+    working = results_df.copy()
+    pair_cols = working.apply(
+        lambda row: _normalize_annotator_pair(
+            row['annotator_a'], row['annotator_b'],
+        ),
+        axis=1,
+        result_type='expand',
+    )
+    working['annotator_a'] = pair_cols[0]
+    working['annotator_b'] = pair_cols[1]
+
+    summary_rows = []
+    for (annotator_a, annotator_b), group in working.groupby(
+        ['annotator_a', 'annotator_b'], sort=True,
+    ):
+        row = {
+            'annotator_a': annotator_a,
+            'annotator_b': annotator_b,
+            'annotator_pair': f"{annotator_a} vs {annotator_b}",
+            'n': len(group),
+        }
+        for metric in metric_cols:
+            row[f'{metric}_mean'] = group[metric].mean()
+            row[f'{metric}_std'] = (
+                group[metric].std(ddof=1) if len(group) > 1 else 0.0
+            )
+        summary_rows.append(row)
+
+    if include_total:
+        total_row = {
+            'annotator_a': 'TOTAL',
+            'annotator_b': 'TOTAL',
+            'annotator_pair': 'TOTAL',
+            'n': len(working),
+        }
+        for metric in metric_cols:
+            total_row[f'{metric}_mean'] = working[metric].mean()
+            total_row[f'{metric}_std'] = (
+                working[metric].std(ddof=1) if len(working) > 1 else 0.0
+            )
+        summary_rows.append(total_row)
+
+    column_order = [
+        'annotator_pair', 'annotator_a', 'annotator_b', 'n',
+        'iou_mean', 'iou_std', 'nsd_mean', 'nsd_std', 'dice_mean', 'dice_std',
+    ]
+    return pd.DataFrame(summary_rows)[column_order]
+
+
+def _average_output_path(output_path):
+    path = Path(output_path)
+    return path.with_name(f"{path.stem}_avg{path.suffix}")
+
+
+def _print_summary_block(summary_df):
+    print('=' * 60)
+    for _, row in summary_df.iterrows():
+        print(
+            f"{row['annotator_pair']:>24}  (n={int(row['n']):>3})  "
+            f"IoU={row['iou_mean']:.4f} +/- {row['iou_std']:.4f}  "
+            f"NSD={row['nsd_mean']:.4f} +/- {row['nsd_std']:.4f}  "
+            f"Dice={row['dice_mean']:.4f} +/- {row['dice_std']:.4f}"
+        )
+    print('=' * 60)
+    print()
+
+
 def find_annotation_pairs(parent_folder):
     """
     Find pairs of annotation files in subfolders of the parent folder.
@@ -239,7 +495,7 @@ def find_annotation_pairs(parent_folder):
     2) Two-expert layout: exactly 2 subfolders, each with all annotations from one
        expert; pairs are formed by matching filenames between the two subfolders.
 
-    Pairs involving blacklisted filenames (from parent_folder/blacklist.txt) are
+    Pairs matching blacklist.txt entries (full filenames or study IDs) are
     filtered out in main(), not here.
 
     Args:
@@ -282,6 +538,9 @@ def find_annotation_pairs(parent_folder):
                     print(f"Warning: Files only in {folder1.name}: {sorted(only_in_1)}")
                 if only_in_2:
                     print(f"Warning: Files only in {folder2.name}: {sorted(only_in_2)}")
+            print(
+                f"Annotator pair: {folder1.name} vs {folder2.name}"
+            )
             return pairs
     
     # Layout 1: each subfolder has 2 files
@@ -312,8 +571,9 @@ def main():
     parser.add_argument(
         '--output',
         type=str,
-        default=None,
-        help='Path to save results CSV (default: print to stdout)'
+        default='results.csv',
+        help='Path to save results CSV; if the file already exists, '
+             'new rows are appended (default: results.csv)'
     )
     parser.add_argument(
         '--verbose',
@@ -340,31 +600,72 @@ def main():
         default=None,
         help='Directory for saved masks (default: tmp/compare_annotation_masks)'
     )
+    parser.add_argument(
+        '--measurements-csv',
+        type=str,
+        default='video_measurements.csv',
+        help='CSV with per-study NSD tau in the "Pixels 1 mm" column '
+             '(default: video_measurements.csv in parent folder)',
+    )
+    parser.add_argument(
+        '--include-total',
+        action='store_true',
+        help='Include a TOTAL row in results_avg.csv / stdout summary, '
+             'aggregated over all rows in the output results CSV',
+    )
     
     args = parser.parse_args()
     
     # Find all annotation pairs
     print(f"Scanning parent folder: {args.parent_folder}")
+    video_measurements = load_video_measurements(
+        args.parent_folder, filename=args.measurements_csv,
+    )
+    print(
+        f"Loaded NSD tau for {len(video_measurements)} studies "
+        f"from {args.measurements_csv}"
+    )
     pairs = find_annotation_pairs(args.parent_folder)
     
     if len(pairs) == 0:
         print("No annotation pairs found!")
         sys.exit(1)
     
-    # Load blacklist and filter pairs
-    blacklist = load_blacklist(args.parent_folder)
-    if blacklist:
-        print(f"Blacklist loaded: {len(blacklist)} file(s) excluded from comparison")
-        original_count = len(pairs)
-        pairs = [
-            (folder_path, f1, f2)
-            for folder_path, f1, f2 in pairs
-            if Path(f1).name not in blacklist and Path(f2).name not in blacklist
+    # Load blacklist (full filenames or study IDs) and filter pairs
+    blacklist_entries, blacklist_match_set = load_blacklist(args.parent_folder)
+    if blacklist_entries:
+        print(
+            f"Blacklist loaded: {len(blacklist_entries)} entr"
+            f"{'y' if len(blacklist_entries) == 1 else 'ies'} "
+            f"(filenames or study IDs)"
+        )
+        pairs, excluded_pairs = filter_pairs_by_blacklist(
+            pairs, blacklist_match_set, measurements=video_measurements,
+        )
+        if excluded_pairs:
+            print(f"Skipped {len(excluded_pairs)} pair(s) due to blacklist:")
+            for item in excluded_pairs:
+                matched = ', '.join(item['matched_ids'])
+                print(f"  - {item['file1']} (matched: {matched})")
+        unmatched_entries = [
+            entry for entry in blacklist_entries
+            if not (
+                _expand_blacklist_entry(entry)
+                & {
+                    matched_id
+                    for item in excluded_pairs
+                    for matched_id in item['matched_ids']
+                }
+            )
         ]
-        skipped = original_count - len(pairs)
-        if skipped:
-            print(f"Skipped {skipped} pair(s) due to blacklist")
-    
+        if unmatched_entries:
+            print(
+                "Warning: blacklist entr"
+                f"{'y' if len(unmatched_entries) == 1 else 'ies'} "
+                "did not match any pair: "
+                + ', '.join(unmatched_entries)
+            )
+
     if len(pairs) == 0:
         print("No annotation pairs remaining after applying blacklist!")
         sys.exit(1)
@@ -382,10 +683,21 @@ def main():
     
     for pair_idx, (folder_path, file1_path, file2_path) in enumerate(pairs):
         try:
+            file1_name = Path(file1_path).name
+            file2_name = Path(file2_path).name
+            annotator_a, annotator_b, annotator_pair = _annotators_from_pair(
+                file1_path, file2_path,
+            )
+            nsd_tau, study_number = get_nsd_tau_for_annotation(
+                file1_name, video_measurements,
+            )
+
             if args.verbose:
                 print(f"\nProcessing pair in {folder_path}:")
-                print(f"  File 1: {Path(file1_path).name}")
-                print(f"  File 2: {Path(file2_path).name}")
+                print(f"  Annotators: {annotator_pair}")
+                print(f"  File 1: {file1_name}")
+                print(f"  File 2: {file2_name}")
+                print(f"  Study: {study_number}, NSD tau={nsd_tau:.0f} px")
             
             # Extract masks from annotations
             mask1 = extract_mask_from_annotation(file1_path)
@@ -404,14 +716,21 @@ def main():
                 print(f"  Mask 1 shape: {mask1.shape}, pixels: {np.sum(mask1)}")
                 print(f"  Mask 2 shape: {mask2.shape}, pixels: {np.sum(mask2)}")
             
-            # Compute metrics
-            metrics = compute_segmentation_metrics(mask1, mask2)
+            # Compute metrics with per-study NSD tau
+            metrics = compute_segmentation_metrics(
+                mask1, mask2, nsd_tau=nsd_tau,
+            )
             
             all_metrics.append(metrics)
             results.append({
                 'folder': folder_path,
-                'file1': Path(file1_path).name,
-                'file2': Path(file2_path).name,
+                'annotator_pair': annotator_pair,
+                'annotator_a': annotator_a,
+                'annotator_b': annotator_b,
+                'file1': file1_name,
+                'file2': file2_name,
+                'study_number': study_number,
+                'nsd_tau': nsd_tau,
                 'iou': metrics['iou'],
                 'nsd': metrics['nsd'],
                 'dice': metrics['dice']
@@ -419,7 +738,7 @@ def main():
             
             if args.verbose:
                 print(f"  IoU: {metrics['iou']:.4f}")
-                print(f"  NSD: {metrics['nsd']:.4f}")
+                print(f"  NSD: {metrics['nsd']:.4f} (tau={nsd_tau:.0f})")
                 print(f"  Dice: {metrics['dice']:.4f}")
         
         except Exception as e:
@@ -429,38 +748,55 @@ def main():
     if len(all_metrics) == 0:
         print("No pairs were successfully processed!")
         sys.exit(1)
-    
-    # Aggregate metrics
-    iou_values = [m['iou'] for m in all_metrics]
-    nsd_values = [m['nsd'] for m in all_metrics]
-    dice_values = [m['dice'] for m in all_metrics]
-    
-    iou_mean = np.mean(iou_values)
-    iou_std = np.std(iou_values)
-    nsd_mean = np.mean(nsd_values)
-    nsd_std = np.std(nsd_values)
-    dice_mean = np.mean(dice_values)
-    dice_std = np.std(dice_values)
-    
-    # Print results
-    print(f"\n{'='*60}")
-    print(f"Aggregated Metrics Across {len(all_metrics)} Pairs:")
-    print(f"{'='*60}")
-    print(f"IoU:  {iou_mean:.4f} ± {iou_std:.4f}")
-    print(f"NSD:  {nsd_mean:.4f} ± {nsd_std:.4f}")
-    print(f"Dice: {dice_mean:.4f} ± {dice_std:.4f}")
-    print(f"{'='*60}\n")
-    
+
+    df_new = pd.DataFrame(results)
+    avg_df_run = build_average_results(
+        df_new, include_total=args.include_total,
+    )
+
+    print(f"\n{'=' * 60}")
+    print(
+        f"Aggregated Pairwise Metrics ({len(all_metrics)} pairs "
+        f"in this run):"
+    )
+    _print_summary_block(avg_df_run)
+
     # Save detailed results if output path is provided
     if args.output:
-        df = pd.DataFrame(results)
-        df.to_csv(args.output, index=False)
-        print(f"Detailed results saved to: {args.output}")
+        output_path = Path(args.output)
+        if output_path.exists() and output_path.stat().st_size > 0:
+            existing = pd.read_csv(output_path)
+            df = pd.concat([existing, df_new], ignore_index=True)
+            df.to_csv(output_path, index=False)
+            print(
+                f"Appended {len(df_new)} row(s) to existing CSV "
+                f"({len(existing)} -> {len(df)}): {output_path}"
+            )
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            df = df_new
+            df.to_csv(output_path, index=False)
+            print(f"Detailed results saved to: {output_path}")
+
+        # TOTAL (if requested) is over all rows currently in this results file
+        avg_df = build_average_results(
+            df, include_total=args.include_total,
+        )
+        avg_output_path = _average_output_path(output_path)
+        avg_df.to_csv(avg_output_path, index=False)
+        print(f"Average results saved to: {avg_output_path}")
+        if len(df) != len(df_new):
+            print(f"\n{'=' * 60}")
+            print(
+                f"Aggregated Pairwise Metrics over full CSV "
+                f"({len(df)} pairs):"
+            )
+            _print_summary_block(avg_df)
     elif args.verbose:
-        # Print detailed results table
-        df = pd.DataFrame(results)
         print("\nDetailed Results:")
-        print(df.to_string(index=False))
+        print(df_new.to_string(index=False))
+        print("\nAverage Results:")
+        print(avg_df_run.to_string(index=False))
 
 
 if __name__ == "__main__":
