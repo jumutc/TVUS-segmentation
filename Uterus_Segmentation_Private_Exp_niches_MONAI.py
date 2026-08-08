@@ -7,6 +7,8 @@ MONAI library instead of segmentation_models_pytorch.
 Key differences:
 - Uses MONAI networks (FlexibleUNet, BasicUNetPlusPlus, BasicUNet, AttentionUnet)
 - Supports MONAI TverskyLoss and BoundaryWeightedTverskyLoss (Tversky + boundary-distance regression)
+- Loads labeled data from Supervisely video exports (ann/*.json + matching videos)
+- Uses a separate control_path for unlabeled control videos (negative samples)
 - Uses MONAI transforms for preprocessing and augmentation (with optional extra augmentations)
 - Preserves the same data loading, GroupShuffleSplit CV, Sacred logging, and MONAI GPU metrics
 
@@ -60,6 +62,9 @@ MONAI_MODELS = {
     "AttentionUnet",
 }
 
+NICHE_CLASS_NAMES = frozenset({"niche"})
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".MP4", ".AVI", ".MOV")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Uterus Segmentation Private Experiment using MONAI")
@@ -67,7 +72,13 @@ def parse_args():
         "--data_path",
         type=str,
         required=True,
-        help="Path to data directory (contains videos/, labels/, metadata_labels.json)",
+        help="Path to Supervisely export root (contains dataset */ann/ and video files)",
+    )
+    parser.add_argument(
+        "--control_path",
+        type=str,
+        default=None,
+        help="Path to root folder with unlabeled control videos; searched recursively in subfolders (optional)",
     )
     parser.add_argument(
         "--control_balance_ratio",
@@ -102,133 +113,190 @@ def parse_args():
     return parser.parse_args()
 
 
-def _is_control_folder(folder_name):
-    """Folders with 'control' in name contain videos without labels (negative samples)."""
-    return "control" in folder_name.lower()
+def _is_niche_class(class_title):
+    title = (class_title or "").lower()
+    return title in NICHE_CLASS_NAMES or any(name in title for name in NICHE_CLASS_NAMES)
 
 
-def _collect_video_paths(videos_root, include_control=False):
-    """Collect video path by filename. Excludes control folders unless include_control=True."""
-    video_by_name = {}
-    for folder in os.listdir(videos_root):
-        folder_path = os.path.join(videos_root, folder)
-        if not os.path.isdir(folder_path):
+def _video_name_from_ann_path(ann_path):
+    return os.path.basename(ann_path)[:-5] if ann_path.endswith(".json") else os.path.basename(ann_path)
+
+
+def _find_supervisely_ann_files(data_path):
+    ann_files = []
+    for root, _, files in os.walk(data_path):
+        if os.path.basename(root) != "ann":
             continue
-        if _is_control_folder(folder) and not include_control:
+        for fname in files:
+            if fname.endswith(".json"):
+                ann_files.append(os.path.join(root, fname))
+    return sorted(ann_files)
+
+
+def _build_video_index(search_roots):
+    video_index = {}
+    for search_root in search_roots:
+        if not search_root or not os.path.isdir(search_root):
             continue
-        for fname in os.listdir(folder_path):
-            if fname.lower().endswith((".mp4", ".avi", ".mov")):
-                video_by_name[fname] = os.path.join(folder_path, fname)
-    return video_by_name
+        for dirpath, _, filenames in os.walk(search_root):
+            for fname in filenames:
+                if fname.lower().endswith(VIDEO_EXTENSIONS):
+                    video_index.setdefault(fname, os.path.join(dirpath, fname))
+    return video_index
 
 
-def _polygon_to_mask(polygon_data, height, width):
-    """Convert Encord polygon (normalized 0-1) to binary mask."""
+def _resolve_video_path(video_name, video_index, ann_path):
+    if video_name in video_index:
+        return video_index[video_name]
+
+    ann_dir = os.path.dirname(ann_path)
+    video_dir = os.path.join(os.path.dirname(ann_dir), "video")
+    candidate = os.path.join(video_dir, video_name)
+    if os.path.isfile(candidate):
+        return candidate
+
+    stem = os.path.splitext(video_name)[0]
+    for ext in VIDEO_EXTENSIONS:
+        candidate = os.path.join(video_dir, f"{stem}{ext}")
+        if os.path.isfile(candidate):
+            return candidate
+        indexed = video_index.get(f"{stem}{ext}")
+        if indexed:
+            return indexed
+    return None
+
+
+def _collect_control_videos(control_path):
+    """Collect video files from control_path, including any nested subfolders."""
+    if not control_path or not os.path.isdir(control_path):
+        return []
+    control_videos = []
+    for dirpath, _, filenames in os.walk(control_path):
+        for fname in filenames:
+            if fname.lower().endswith(VIDEO_EXTENSIONS):
+                control_videos.append(os.path.join(dirpath, fname))
+    return sorted(set(control_videos))
+
+
+def _points_to_contour(points):
+    if not points:
+        return None
+    contour = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+    if contour.shape[0] < 3:
+        return None
+    return contour
+
+
+def _supervisely_polygon_to_mask(exterior, interior, height, width):
     mask = np.zeros((height, width), dtype=np.uint8)
-    if not polygon_data:
+    exterior_contour = _points_to_contour(exterior)
+    if exterior_contour is None:
         return mask
-    pts = []
-    if isinstance(polygon_data, dict):
-        keys = sorted(polygon_data.keys(), key=lambda k: int(k) if k.isdigit() else k)
-        for k in keys:
-            pt = polygon_data[k]
-            x = int(pt["x"] * width)
-            y = int(pt["y"] * height)
-            pts.append([x, y])
-    elif isinstance(polygon_data, list) and len(polygon_data) > 0:
-        flat = polygon_data[0][0] if isinstance(polygon_data[0][0], (list, tuple)) else polygon_data[0]
-        for i in range(0, len(flat), 2):
-            x, y = int(flat[i] * width), int(flat[i + 1] * height)
-            pts.append([x, y])
-    if len(pts) >= 3:
-        pts = np.array(pts, dtype=np.int32)
-        cv2.fillPoly(mask, [pts], 255)
+
+    cv2.fillPoly(mask, [exterior_contour], 255)
+    for hole in interior or []:
+        hole_contour = _points_to_contour(hole)
+        if hole_contour is not None:
+            cv2.fillPoly(mask, [hole_contour], 0)
     return mask
 
 
-def _create_mask_from_encord_objects(objects, height, width):
-    """Create binary mask from Encord frame objects (polygon annotations)."""
-    mask = np.zeros((height, width), dtype=np.uint8)
-    for obj in objects:
-        if obj.get("shape") != "polygon":
+def _get_niche_object_keys(annotation):
+    return {
+        obj["key"]
+        for obj in annotation.get("objects", [])
+        if _is_niche_class(obj.get("classTitle"))
+    }
+
+
+def _scale_points(points, scale_x, scale_y):
+    scaled = []
+    for x, y in points:
+        scaled.append([int(round(x * scale_x)), int(round(y * scale_y))])
+    return scaled
+
+
+def _create_mask_from_supervisely_frame(frame, niche_keys, ann_width, ann_height, mask_width, mask_height):
+    mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
+    scale_x = mask_width / ann_width if ann_width else 1.0
+    scale_y = mask_height / ann_height if ann_height else 1.0
+
+    for figure in frame.get("figures", []):
+        if figure.get("geometryType") != "polygon":
             continue
-        poly = obj.get("polygon")
-        if isinstance(poly, dict):
-            single = _polygon_to_mask(poly, height, width)
-            mask = np.maximum(mask, single)
-        elif obj.get("polygons"):
-            for poly_contour in obj["polygons"]:
-                flat = poly_contour[0] if poly_contour and isinstance(poly_contour[0], (list, tuple)) else poly_contour
-                if not isinstance(flat, (list, tuple)) or len(flat) < 6:
-                    continue
-                pts = []
-                for i in range(0, len(flat), 2):
-                    pts.append([int(flat[i] * width), int(flat[i + 1] * height)])
-                if len(pts) >= 3:
-                    cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 255)
+        if figure.get("objectKey") not in niche_keys:
+            continue
+        points = figure.get("geometry", {}).get("points", {})
+        exterior = _scale_points(points.get("exterior", []), scale_x, scale_y)
+        interior = [_scale_points(hole, scale_x, scale_y) for hole in points.get("interior", [])]
+        polygon_mask = _supervisely_polygon_to_mask(exterior, interior, mask_height, mask_width)
+        mask = np.maximum(mask, polygon_mask)
     return mask
 
 
-def create_df(data_path, control_balance_ratio=0.3):
+def create_df(data_path, control_path=None, control_balance_ratio=0.3):
     """
-    Build dataframe from new data format:
-    - data/metadata_labels.json: label_hash -> video filename
-    - data/labels/{label_hash}.json: Encord format, frame -> polygon objects
-    - data/videos/: videos; folders with 'control' excluded from labels, used for balancing
+    Build dataframe from a Supervisely video export:
+    - {data_path}/dataset */ann/{video_name}.mp4.json
+    - matching videos under sibling video/ folders or anywhere under data_path
+    - optional control_path: root folder tree of unlabeled videos (searched recursively)
     """
-    metadata_path = os.path.join(data_path, "metadata_labels.json")
-    labels_dir = os.path.join(data_path, "labels")
-    videos_dir = os.path.join(data_path, "videos")
+    if not os.path.isdir(data_path):
+        raise FileNotFoundError(f"Data path not found: {data_path}")
 
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(f"Metadata not found: {metadata_path}")
-    if not os.path.isdir(labels_dir):
-        raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
-    if not os.path.isdir(videos_dir):
-        raise FileNotFoundError(f"Videos directory not found: {videos_dir}")
+    ann_files = _find_supervisely_ann_files(data_path)
+    if not ann_files:
+        raise FileNotFoundError(f"No Supervisely ann/*.json files found under {data_path}")
 
-    with open(metadata_path) as f:
-        metadata = json.load(f)
-
-    label_to_video = {m["label_hash"]: m["title"] for m in metadata if m.get("title")}
-
-    labeled_videos = _collect_video_paths(videos_dir, include_control=False)
-    control_videos = {}
-    for folder in os.listdir(videos_dir):
-        folder_path = os.path.join(videos_dir, folder)
-        if not os.path.isdir(folder_path) or not _is_control_folder(folder):
-            continue
-        for fname in os.listdir(folder_path):
-            if fname.lower().endswith((".mp4", ".avi", ".mov")):
-                control_videos[fname] = os.path.join(folder_path, fname)
-
+    video_index = _build_video_index([data_path])
     rows = []
-    for label_hash, video_filename in tqdm(label_to_video.items(), desc="Loading labeled data"):
-        video_path = labeled_videos.get(video_filename)
-        if not video_path or not os.path.isfile(video_path):
+    missing_videos = 0
+    skipped_empty = 0
+
+    for ann_path in tqdm(ann_files, desc="Loading labeled data"):
+        video_name = _video_name_from_ann_path(ann_path)
+        video_path = _resolve_video_path(video_name, video_index, ann_path)
+        if not video_path:
+            missing_videos += 1
             continue
-        label_path = os.path.join(labels_dir, f"{label_hash}.json")
-        if not os.path.isfile(label_path):
+
+        with open(ann_path, encoding="utf-8") as f:
+            annotation = json.load(f)
+
+        niche_keys = _get_niche_object_keys(annotation)
+        if not niche_keys:
+            skipped_empty += 1
             continue
-        with open(label_path) as f:
-            label_data = json.load(f)
-        if not isinstance(label_data, dict):
+
+        frames = annotation.get("frames", [])
+        if not frames:
+            skipped_empty += 1
             continue
+
+        ann_width = int(annotation["size"]["width"])
+        ann_height = int(annotation["size"]["height"])
 
         cap = cv2.VideoCapture(video_path)
         vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         cap.release()
+        if vh <= 0 or vw <= 0:
+            missing_videos += 1
+            continue
 
-        volume_id = os.path.splitext(video_filename)[0]
-        for frame_key, frame_data in label_data.items():
-            if not frame_key.isdigit():
+        volume_id = os.path.splitext(os.path.basename(video_name))[0]
+        for frame_data in frames:
+            frame_idx = int(frame_data["index"])
+            mask = _create_mask_from_supervisely_frame(
+                frame_data,
+                niche_keys,
+                ann_width,
+                ann_height,
+                vw,
+                vh,
+            )
+            if not mask.any():
                 continue
-            frame_idx = int(frame_key)
-            objs = frame_data.get("objects", [])
-            if not objs:
-                continue
-            mask = _create_mask_from_encord_objects(objs, vh, vw)
             rows.append(
                 {
                     "video_path": video_path,
@@ -241,11 +309,15 @@ def create_df(data_path, control_balance_ratio=0.3):
     n_labeled = len(rows)
     n_control_target = max(0, int(n_labeled * control_balance_ratio))
     print("Total Labeled Images: ", n_labeled)
+    if missing_videos:
+        print(f"Skipped {missing_videos} annotation files with missing or unreadable videos")
+    if skipped_empty:
+        print(f"Skipped {skipped_empty} annotation files without Niche labels")
 
+    control_videos = _collect_control_videos(control_path)
     if n_control_target > 0 and control_videos:
-        control_paths = list(control_videos.values())
         added = 0
-        for video_path in control_paths:
+        for video_path in control_videos:
             if added >= n_control_target:
                 break
             cap = cv2.VideoCapture(video_path)
@@ -253,7 +325,7 @@ def create_df(data_path, control_balance_ratio=0.3):
             vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             cap.release()
-            if n_frames <= 0:
+            if n_frames <= 0 or vh <= 0 or vw <= 0:
                 continue
             volume_id = os.path.splitext(os.path.basename(video_path))[0]
             indices = np.linspace(0, n_frames - 1, min(n_control_target - added, max(1, n_frames // 5)), dtype=int)
@@ -269,6 +341,12 @@ def create_df(data_path, control_balance_ratio=0.3):
                     }
                 )
                 added += 1
+        print(f"Added {added} control frames from {len(control_videos)} control videos")
+    elif n_control_target > 0:
+        print("No control videos found; skipping control balancing")
+
+    if not rows:
+        raise ValueError("No training samples found. Check data_path, video files, and annotations.")
 
     return pd.DataFrame(rows, index=np.arange(len(rows)))
 
@@ -557,6 +635,7 @@ def config():
         "decoder_channels": (256, 128, 64, 32, 16),
     }
     data_path = ""
+    control_path = ""
     control_balance_ratio = 0.3
     model_output = "model_tvus.pt"
     csv_output = "input.csv"
@@ -591,7 +670,15 @@ def get_use_extra_augmentations(use_extra_augmentations):
 
 
 @ex.main
-def run_experiment(_run, data_path, control_balance_ratio, model_output, csv_output, use_extra_augmentations):
+def run_experiment(
+    _run,
+    data_path,
+    control_path,
+    control_balance_ratio,
+    model_output,
+    csv_output,
+    use_extra_augmentations,
+):
     max_lr = 1e-4
     epochs = 200
     weight_decay = 1e-4
@@ -600,7 +687,7 @@ def run_experiment(_run, data_path, control_balance_ratio, model_output, csv_out
     best_dice_scores = {}
     height, width = 512, 768
 
-    df = create_df(data_path, control_balance_ratio)
+    df = create_df(data_path, control_path or None, control_balance_ratio)
     print("Total Images: ", len(df))
     print(df.head())
     df[["volume_id", "video_path", "frame_idx"]].to_csv(csv_output, index=False)
@@ -740,6 +827,7 @@ def get_model_output_path(base_path, model_name, encoder_name, has_aug, loss_nam
 def _common_run_kwargs(args):
     return {
         "data_path": args.data_path,
+        "control_path": args.control_path or "",
         "control_balance_ratio": args.control_balance_ratio,
         "csv_output": args.csv_output,
         "sacred_runs": args.sacred_runs,
