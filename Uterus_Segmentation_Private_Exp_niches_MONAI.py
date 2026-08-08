@@ -6,8 +6,8 @@ MONAI library instead of segmentation_models_pytorch.
 
 Key differences:
 - Uses MONAI networks (FlexibleUNet, BasicUNetPlusPlus, BasicUNet, AttentionUnet)
-- Uses BoundaryWeightedTverskyLoss (Tversky + boundary-distance regression)
-- Uses MONAI transforms for preprocessing and augmentation
+- Supports MONAI TverskyLoss and BoundaryWeightedTverskyLoss (Tversky + boundary-distance regression)
+- Uses MONAI transforms for preprocessing and augmentation (with optional extra augmentations)
 - Preserves the same data loading, GroupShuffleSplit CV, Sacred logging, and MONAI GPU metrics
 
 Requirements:
@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+from monai.losses import TverskyLoss
 from monai_segmentation_losses import BoundaryWeightedTverskyLoss, resolve_model_out_channels
 from monai_segmentation_metrics import MonaiValidationMetrics
 from monai.networks.nets import AttentionUnet, BasicUNet, BasicUNetPlusPlus, FlexibleUNet
@@ -551,7 +552,7 @@ def config():
     model_name = "FlexibleUNet"
     model_params = {
         "in_channels": 3,
-        "out_channels": 2,
+        "out_channels": 1,
         "pretrained": True,
         "decoder_channels": (256, 128, 64, 32, 16),
     }
@@ -680,12 +681,103 @@ def run_experiment(_run, data_path, control_balance_ratio, model_output, csv_out
     _run.log_scalar("std.Dice", float(np.nanstd(best_dice_scores)))
 
 
-def get_model_output_path(base_path, model_name, encoder_name, has_aug):
+LOSS_PRESETS = {
+    "boundary_tversky": {
+        "losses": "[BoundaryWeightedTverskyLoss(sigmoid=True, include_background=True, boundary_lambda=0.5)]",
+        "out_channels": 2,
+    },
+    "tversky": {
+        "losses": "[TverskyLoss(sigmoid=True, include_background=True)]",
+        "out_channels": 1,
+    },
+}
+
+MODEL_PRESETS = {
+    "FlexibleUNet": {
+        "encoder_name": "efficientnet-b7",
+        "model_params": {
+            "in_channels": 3,
+            "pretrained": True,
+            "decoder_channels": (256, 128, 64, 32, 16),
+        },
+    },
+    "BasicUNetPlusPlus": {
+        "encoder_name": "",
+        "model_params": {
+            "in_channels": 3,
+            "features": (64, 128, 256, 512, 1024, 128),
+            "deep_supervision": False,
+        },
+    },
+    "BasicUNet": {
+        "encoder_name": "",
+        "model_params": {
+            "in_channels": 3,
+            "features": (64, 128, 256, 512, 1024, 128),
+        },
+    },
+    "AttentionUnet": {
+        "encoder_name": "",
+        "model_params": {
+            "in_channels": 3,
+            "channels": (16, 32, 64, 128, 256),
+            "strides": (2, 2, 2, 2),
+        },
+    },
+}
+
+
+def get_model_output_path(base_path, model_name, encoder_name, has_aug, loss_name=""):
     """Generate a unique model output path with postfix."""
     base_name, ext = os.path.splitext(base_path)
     aug_suffix = "_aug" if has_aug else "_noaug"
-    postfix = f"_{model_name}_{encoder_name}_{aug_suffix}"
+    encoder_suffix = encoder_name or "default"
+    loss_suffix = loss_name or "loss"
+    postfix = f"_{model_name}_{encoder_suffix}_{loss_suffix}{aug_suffix}"
     return f"{base_name}{postfix}{ext}"
+
+
+def _common_run_kwargs(args):
+    return {
+        "data_path": args.data_path,
+        "control_balance_ratio": args.control_balance_ratio,
+        "csv_output": args.csv_output,
+        "sacred_runs": args.sacred_runs,
+        "dataset_name": args.dataset_name,
+    }
+
+
+def build_experiment_configs(args):
+    """Build Sacred config updates for every model × loss × augmentation combination."""
+    common = _common_run_kwargs(args)
+    configs = []
+
+    for model_name, model_preset in MODEL_PRESETS.items():
+        encoder_name = model_preset["encoder_name"]
+        for loss_name, loss_preset in LOSS_PRESETS.items():
+            model_params = model_preset["model_params"].copy()
+            model_params["out_channels"] = loss_preset["out_channels"]
+
+            for use_extra_augmentations in (False, True):
+                configs.append(
+                    {
+                        **common,
+                        "losses": loss_preset["losses"],
+                        "encoder_name": encoder_name,
+                        "model_name": model_name,
+                        "model_params": model_params,
+                        "use_extra_augmentations": use_extra_augmentations,
+                        "model_output": get_model_output_path(
+                            args.model_output,
+                            model_name,
+                            encoder_name,
+                            use_extra_augmentations,
+                            loss_name,
+                        ),
+                    }
+                )
+
+    return configs
 
 
 if __name__ == "__main__":
@@ -693,63 +785,12 @@ if __name__ == "__main__":
 
     ex.observers.append(FileStorageObserver(args.sacred_runs))
 
-    ex.run(
-        config_updates={
-            "losses": "[BoundaryWeightedTverskyLoss(sigmoid=True, include_background=True, boundary_lambda=0.5)]",
-            "encoder_name": "efficientnet-b7",
-            "model_name": "FlexibleUNet",
-            "model_params": {
-                "in_channels": 3,
-                "out_channels": 2,
-                "pretrained": True,
-                "decoder_channels": (256, 128, 64, 32, 16),
-            },
-            "use_extra_augmentations": False,
-            "data_path": args.data_path,
-            "control_balance_ratio": args.control_balance_ratio,
-            "model_output": get_model_output_path(args.model_output, "FlexibleUNet", "efficientnet-b7", False),
-            "csv_output": args.csv_output,
-            "sacred_runs": args.sacred_runs,
-            "dataset_name": args.dataset_name,
-        }
-    )
-    # ex.run(
-    #     config_updates={
-    #         "losses": "[BoundaryWeightedTverskyLoss(sigmoid=True, include_background=True, boundary_lambda=0.5, boundary_sigma=6.0)]",
-    #         "encoder_name": "efficientnet-b7",
-    #         "model_name": "FlexibleUNet",
-    #         "model_params": {
-    #             "in_channels": 3,
-    #             "out_channels": 1,
-    #             "pretrained": True,
-    #             "decoder_channels": (256, 128, 64, 32, 16),
-    #         },
-    #         "use_extra_augmentations": True,
-    #         "data_path": args.data_path,
-    #         "control_balance_ratio": args.control_balance_ratio,
-    #         "model_output": get_model_output_path(args.model_output, "FlexibleUNet", "efficientnet-b7", True),
-    #         "csv_output": args.csv_output,
-    #         "sacred_runs": args.sacred_runs,
-    #         "dataset_name": args.dataset_name,
-    #     }
-    # )
-    # ex.run(
-    #     config_updates={
-    #         "losses": "[BoundaryWeightedTverskyLoss(sigmoid=True, include_background=True, boundary_lambda=0.5, boundary_sigma=6.0)]",
-    #         "encoder_name": "",
-    #         "model_name": "BasicUNetPlusPlus",
-    #         "model_params": {
-    #             "in_channels": 3,
-    #             "out_channels": 1,
-    #             "features": (64, 128, 256, 512, 1024, 128),
-    #             "deep_supervision": False,
-    #         },
-    #         "use_extra_augmentations": False,
-    #         "data_path": args.data_path,
-    #         "control_balance_ratio": args.control_balance_ratio,
-    #         "model_output": get_model_output_path(args.model_output, "BasicUNetPlusPlus", "default", False),
-    #         "csv_output": args.csv_output,
-    #         "sacred_runs": args.sacred_runs,
-    #         "dataset_name": args.dataset_name,
-    #     }
-    # )
+    for config_updates in build_experiment_configs(args):
+        print(
+            "Running experiment:",
+            config_updates["model_name"],
+            config_updates["encoder_name"] or "default",
+            config_updates["losses"],
+            "aug" if config_updates["use_extra_augmentations"] else "noaug",
+        )
+        ex.run(config_updates=config_updates)
