@@ -234,6 +234,33 @@ def _create_mask_from_supervisely_frame(frame, niche_keys, ann_width, ann_height
     return mask
 
 
+def _probe_video(video_path):
+    """Return (width, height) for a readable video, or None if missing/corrupt."""
+    if not video_path or not os.path.isfile(video_path):
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        return None
+
+    vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if vw > 0 and vh > 0:
+        cap.release()
+        return vw, vh
+
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None:
+        return None
+
+    h, w = frame.shape[:2]
+    if w <= 0 or h <= 0:
+        return None
+    return w, h
+
+
 def create_df(data_path, control_path=None, control_balance_ratio=0.3):
     """
     Build dataframe from a Supervisely video export:
@@ -251,7 +278,10 @@ def create_df(data_path, control_path=None, control_balance_ratio=0.3):
     video_index = _build_video_index([data_path])
     rows = []
     missing_videos = 0
+    unreadable_videos = 0
+    unreadable_samples = []
     skipped_empty = 0
+    loaded_videos = 0
 
     for ann_path in tqdm(ann_files, desc="Loading labeled data"):
         video_name = _video_name_from_ann_path(ann_path)
@@ -276,14 +306,15 @@ def create_df(data_path, control_path=None, control_balance_ratio=0.3):
         ann_width = int(annotation["size"]["width"])
         ann_height = int(annotation["size"]["height"])
 
-        cap = cv2.VideoCapture(video_path)
-        vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        cap.release()
-        if vh <= 0 or vw <= 0:
-            missing_videos += 1
+        video_size = _probe_video(video_path)
+        if video_size is None:
+            unreadable_videos += 1
+            if len(unreadable_samples) < 10:
+                unreadable_samples.append(video_path)
             continue
 
+        vw, vh = video_size
+        loaded_videos += 1
         volume_id = os.path.splitext(os.path.basename(video_name))[0]
         for frame_data in frames:
             frame_idx = int(frame_data["index"])
@@ -309,8 +340,13 @@ def create_df(data_path, control_path=None, control_balance_ratio=0.3):
     n_labeled = len(rows)
     n_control_target = max(0, int(n_labeled * control_balance_ratio))
     print("Total Labeled Images: ", n_labeled)
+    print(f"Loaded {loaded_videos} videos from {len(ann_files)} annotation files")
     if missing_videos:
-        print(f"Skipped {missing_videos} annotation files with missing or unreadable videos")
+        print(f"Skipped {missing_videos} annotation files with no matching video file")
+    if unreadable_videos:
+        print(f"Skipped {unreadable_videos} annotation files with corrupt/unreadable videos")
+        for sample_path in unreadable_samples:
+            print(f"  unreadable: {sample_path}")
     if skipped_empty:
         print(f"Skipped {skipped_empty} annotation files without Niche labels")
 
@@ -320,12 +356,14 @@ def create_df(data_path, control_path=None, control_balance_ratio=0.3):
         for video_path in control_videos:
             if added >= n_control_target:
                 break
+            video_size = _probe_video(video_path)
+            if video_size is None:
+                continue
+            vw, vh = video_size
             cap = cv2.VideoCapture(video_path)
             n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             cap.release()
-            if n_frames <= 0 or vh <= 0 or vw <= 0:
+            if n_frames <= 0:
                 continue
             volume_id = os.path.splitext(os.path.basename(video_path))[0]
             indices = np.linspace(0, n_frames - 1, min(n_control_target - added, max(1, n_frames // 5)), dtype=int)
