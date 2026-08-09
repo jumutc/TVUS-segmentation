@@ -824,7 +824,7 @@ def config():
     control_path = ""
     control_balance_ratio = 0.3
     model_output = "model_tvus.pt"
-    csv_output = "input.csv"
+    csv_input = "input.csv"
     results_csv = "experiment_results.csv"
     sacred_runs = "uterus_runs_monai"
     dataset_name = "TVUS (private)"
@@ -863,7 +863,7 @@ def run_experiment(
     control_path,
     control_balance_ratio,
     model_output,
-    csv_output,
+    csv_input,
     results_csv,
     use_extra_augmentations,
 ):
@@ -881,7 +881,7 @@ def run_experiment(
     df = create_df(data_path, control_path or None, control_balance_ratio)
     print("Total Images: ", len(df))
     print(df.head())
-    df[["volume_id", "video_path", "frame_idx"]].to_csv(csv_output, index=False)
+    df[["volume_id", "video_path", "frame_idx"]].to_csv(csv_input, index=False)
 
     for i, (X_train, X_val) in enumerate(
         GroupShuffleSplit(n_splits=3, test_size=0.15, random_state=0).split(df.index, groups=df["volume_id"])
@@ -1068,7 +1068,7 @@ def _common_run_kwargs(args):
         "data_path": args.data_path,
         "control_path": args.control_path or "",
         "control_balance_ratio": args.control_balance_ratio,
-        "csv_output": args.csv_output,
+        "csv_input": args.csv_input,
         "results_csv": args.results_csv,
         "sacred_runs": args.sacred_runs,
         "dataset_name": args.dataset_name,
