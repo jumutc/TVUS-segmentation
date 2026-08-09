@@ -17,6 +17,8 @@ MONAI components:
 
 Requirements:
 - monai: pip install monai
+- Recommended: CUDA GPU with >=16GB VRAM (24GB comfortable for 512x768, batch_size=2).
+  This variant preloads images into memory; prefer >=32–64GB system RAM for large datasets.
 """
 
 import argparse
@@ -143,12 +145,18 @@ def create_df(image_path, seg_path):
 
 
 def build_monai_transforms(height, width, train=True, use_extra_augmentations=False):
-    """Build MONAI preprocessing/augmentation pipeline for image and label."""
+    """Build MONAI preprocessing/augmentation pipeline for image and label.
+
+    Spatial size is fixed to (height, width). RandRotate90d is only used when the
+    canvas is square; on non-square inputs (e.g. 512x768) a 90° rotate swaps H/W
+    and breaks torch.stack in the DataLoader collate.
+    """
     keys = ["image", "label"]
+    spatial_size = (height, width)
     transforms = [
         EnsureChannelFirstd(keys=["image"], channel_dim=-1),
         EnsureChannelFirstd(keys=["label"], channel_dim="no_channel"),
-        Resized(keys=keys, spatial_size=(height, width), mode=["bilinear", "nearest"]),
+        Resized(keys=keys, spatial_size=spatial_size, mode=["bilinear", "nearest"]),
         ScaleIntensityRanged(keys=["image"], a_min=0, a_max=255, b_min=0.0, b_max=1.0, clip=True),
     ]
 
@@ -160,15 +168,36 @@ def build_monai_transforms(height, width, train=True, use_extra_augmentations=Fa
             ]
         )
         if use_extra_augmentations:
-            transforms.extend(
+            extra = [
+                RandRotated(
+                    keys=keys,
+                    range_x=np.pi / 12,
+                    prob=0.2,
+                    keep_size=True,
+                    mode=["bilinear", "nearest"],
+                    padding_mode="zeros",
+                ),
+            ]
+            # 90° rotates swap axes; only safe when height == width.
+            if height == width:
+                extra.append(RandRotate90d(keys=keys, prob=0.2, spatial_axes=(0, 1)))
+            extra.extend(
                 [
-                    RandRotated(keys=keys, range_x=np.pi / 12, prob=0.2, mode=["bilinear", "nearest"], padding_mode="zeros"),
-                    RandRotate90d(keys=keys, prob=0.2, spatial_axes=(0, 1)),
-                    RandZoomd(keys=keys, prob=0.3, min_zoom=0.9, max_zoom=1.1, mode=["bilinear", "nearest"]),
+                    RandZoomd(
+                        keys=keys,
+                        prob=0.3,
+                        min_zoom=0.9,
+                        max_zoom=1.1,
+                        keep_size=True,
+                        mode=["bilinear", "nearest"],
+                    ),
                     RandGaussianNoised(keys=["image"], prob=0.3, mean=0.0, std=0.05),
                     RandGaussianSmoothd(keys=["image"], prob=0.3, sigma_x=(0.5, 1.0), sigma_y=(0.5, 1.0)),
                 ]
             )
+            transforms.extend(extra)
+            # Guarantee uniform spatial size before batch collation.
+            transforms.append(Resized(keys=keys, spatial_size=spatial_size, mode=["bilinear", "nearest"]))
 
     transforms.append(EnsureTyped(keys=keys, data_type="tensor"))
     return Compose(transforms)
@@ -493,8 +522,12 @@ def run_experiment(_run, image_path, seg_path, model_output, csv_output, use_ext
         val_df = df.loc[X_val].reset_index()
         val_set = TVUSMONAIDataset(val_df, t_val)
 
-        train_loader = DataLoader(train_set, batch_size=2, shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_set, batch_size=1, shuffle=False, drop_last=False)
+        train_loader = DataLoader(
+            train_set, batch_size=2, shuffle=True, drop_last=True, pin_memory=torch.cuda.is_available()
+        )
+        val_loader = DataLoader(
+            val_set, batch_size=1, shuffle=False, drop_last=False, pin_memory=torch.cuda.is_available()
+        )
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,

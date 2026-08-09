@@ -14,6 +14,9 @@ Key differences:
 
 Requirements:
 - monai: pip install monai
+- Recommended: CUDA GPU with >=16GB VRAM (24GB comfortable for 512x768, batch_size=2,
+  including FlexibleUNet/efficientnet-b7). System RAM >=32GB (64GB comfortable);
+  this script streams frames from video and does not preload the full dataset.
 """
 
 import argparse
@@ -22,6 +25,8 @@ import json
 import os
 import ssl
 import time
+import traceback
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -64,6 +69,115 @@ MONAI_MODELS = {
 
 NICHE_CLASS_NAMES = frozenset({"niche"})
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".MP4", ".AVI", ".MOV")
+RESULTS_CSV_COLUMNS = [
+    "timestamp",
+    "sacred_run_id",
+    "model_name",
+    "encoder_name",
+    "losses",
+    "use_extra_augmentations",
+    "fold",
+    "n_folds",
+    "miou",
+    "nsd",
+    "dice",
+    "miou_std",
+    "nsd_std",
+    "dice_std",
+    "model_output",
+    "status",
+]
+
+
+def append_experiment_result(results_csv, row):
+    """Append one metrics row to results_csv, creating the file if needed."""
+    if not results_csv:
+        return
+
+    abs_path = os.path.abspath(results_csv)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    ordered = {col: row.get(col) for col in RESULTS_CSV_COLUMNS}
+    df_new = pd.DataFrame([ordered], columns=RESULTS_CSV_COLUMNS)
+
+    if os.path.isfile(abs_path) and os.path.getsize(abs_path) > 0:
+        existing = pd.read_csv(abs_path)
+        for col in RESULTS_CSV_COLUMNS:
+            if col not in existing.columns:
+                existing[col] = np.nan
+        df = pd.concat([existing, df_new], ignore_index=True)[RESULTS_CSV_COLUMNS]
+        df.to_csv(abs_path, index=False)
+        print(f"Appended result to {abs_path} ({len(existing)} -> {len(df)} rows)")
+    else:
+        df_new.to_csv(abs_path, index=False)
+        print(f"Wrote result to {abs_path}")
+
+
+def _aggregate_fold_metrics(best_iou_scores, best_nsd_scores, best_dice_scores):
+    """Mean/std of best fold metrics for a sacred run total row."""
+    iou = np.asarray(list(best_iou_scores.values() if isinstance(best_iou_scores, dict) else best_iou_scores), dtype=float)
+    nsd = np.asarray(list(best_nsd_scores.values() if isinstance(best_nsd_scores, dict) else best_nsd_scores), dtype=float)
+    dice = np.asarray(list(best_dice_scores.values() if isinstance(best_dice_scores, dict) else best_dice_scores), dtype=float)
+    n_folds = int(max(len(iou), len(nsd), len(dice)))
+    # Sample std (ddof=1) when >=2 folds so analytics match typical CV reporting.
+    ddof = 1 if n_folds >= 2 else 0
+
+    def _mean_std(arr):
+        if len(arr) == 0:
+            return float("nan"), float("nan")
+        return float(np.nanmean(arr)), float(np.nanstd(arr, ddof=ddof))
+
+    miou_mean, miou_std = _mean_std(iou)
+    nsd_mean, nsd_std = _mean_std(nsd)
+    dice_mean, dice_std = _mean_std(dice)
+    return {
+        "n_folds": n_folds,
+        "miou": miou_mean,
+        "nsd": nsd_mean,
+        "dice": dice_mean,
+        "miou_std": miou_std,
+        "nsd_std": nsd_std,
+        "dice_std": dice_std,
+    }
+
+
+def _experiment_result_row(
+    _run,
+    model_name,
+    encoder_name,
+    losses,
+    use_extra_augmentations,
+    model_output,
+    fold,
+    miou,
+    nsd,
+    dice,
+    status,
+    miou_std=None,
+    nsd_std=None,
+    dice_std=None,
+    n_folds=None,
+):
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sacred_run_id": getattr(_run, "_id", None),
+        "model_name": model_name,
+        "encoder_name": encoder_name or "default",
+        "losses": losses if isinstance(losses, str) else str(losses),
+        "use_extra_augmentations": bool(use_extra_augmentations),
+        "fold": fold,
+        "n_folds": n_folds,
+        "miou": miou,
+        "nsd": nsd,
+        "dice": dice,
+        "miou_std": miou_std,
+        "nsd_std": nsd_std,
+        "dice_std": dice_std,
+        "model_output": model_output,
+        "status": status,
+    }
 
 
 def parse_args():
@@ -93,10 +207,17 @@ def parse_args():
         help="Path to save the trained model (default: model_tvus.pt)",
     )
     parser.add_argument(
-        "--csv_output",
+        "--csv_input",
         type=str,
         default="input.csv",
         help="Path to save the input CSV file (default: input.csv)",
+    )
+    parser.add_argument(
+        "--results_csv",
+        type=str,
+        default="experiment_results.csv",
+        help="Path for experiment metrics CSV; created if missing, appended if present "
+        "(default: experiment_results.csv)",
     )
     parser.add_argument(
         "--sacred_runs",
@@ -401,12 +522,18 @@ def _read_frame_from_video(video_path, frame_idx):
 
 
 def build_monai_transforms(height, width, train=True, use_extra_augmentations=False):
-    """Build MONAI preprocessing/augmentation pipeline for image and label."""
+    """Build MONAI preprocessing/augmentation pipeline for image and label.
+
+    Spatial size is fixed to (height, width). RandRotate90d is only used when the
+    canvas is square; on non-square inputs (e.g. 512x768) a 90° rotate swaps H/W
+    and breaks torch.stack in the DataLoader collate.
+    """
     keys = ["image", "label"]
+    spatial_size = (height, width)
     transforms = [
         EnsureChannelFirstd(keys=["image"], channel_dim=-1),
         EnsureChannelFirstd(keys=["label"], channel_dim="no_channel"),
-        Resized(keys=keys, spatial_size=(height, width), mode=["bilinear", "nearest"]),
+        Resized(keys=keys, spatial_size=spatial_size, mode=["bilinear", "nearest"]),
         ScaleIntensityRanged(keys=["image"], a_min=0, a_max=255, b_min=0.0, b_max=1.0, clip=True),
     ]
 
@@ -418,15 +545,36 @@ def build_monai_transforms(height, width, train=True, use_extra_augmentations=Fa
             ]
         )
         if use_extra_augmentations:
-            transforms.extend(
+            extra = [
+                RandRotated(
+                    keys=keys,
+                    range_x=np.pi / 12,
+                    prob=0.2,
+                    keep_size=True,
+                    mode=["bilinear", "nearest"],
+                    padding_mode="zeros",
+                ),
+            ]
+            # 90° rotates swap axes; only safe when height == width.
+            if height == width:
+                extra.append(RandRotate90d(keys=keys, prob=0.2, spatial_axes=(0, 1)))
+            extra.extend(
                 [
-                    RandRotated(keys=keys, range_x=np.pi / 12, prob=0.2, mode=["bilinear", "nearest"], padding_mode="zeros"),
-                    RandRotate90d(keys=keys, prob=0.2, spatial_axes=(0, 1)),
-                    RandZoomd(keys=keys, prob=0.3, min_zoom=0.9, max_zoom=1.1, mode=["bilinear", "nearest"]),
+                    RandZoomd(
+                        keys=keys,
+                        prob=0.3,
+                        min_zoom=0.9,
+                        max_zoom=1.1,
+                        keep_size=True,
+                        mode=["bilinear", "nearest"],
+                    ),
                     RandGaussianNoised(keys=["image"], prob=0.3, mean=0.0, std=0.05),
                     RandGaussianSmoothd(keys=["image"], prob=0.3, sigma_x=(0.5, 1.0), sigma_y=(0.5, 1.0)),
                 ]
             )
+            transforms.extend(extra)
+            # Guarantee uniform spatial size before batch collation.
+            transforms.append(Resized(keys=keys, spatial_size=spatial_size, mode=["bilinear", "nearest"]))
 
     transforms.append(EnsureTyped(keys=keys, data_type="tensor"))
     return Compose(transforms)
@@ -677,6 +825,7 @@ def config():
     control_balance_ratio = 0.3
     model_output = "model_tvus.pt"
     csv_output = "input.csv"
+    results_csv = "experiment_results.csv"
     sacred_runs = "uterus_runs_monai"
     dataset_name = "TVUS (private)"
     use_extra_augmentations = False
@@ -715,6 +864,7 @@ def run_experiment(
     control_balance_ratio,
     model_output,
     csv_output,
+    results_csv,
     use_extra_augmentations,
 ):
     max_lr = 1e-4
@@ -724,6 +874,9 @@ def run_experiment(
     best_nsd_scores = {}
     best_dice_scores = {}
     height, width = 512, 768
+    model_name = get_model_name()
+    encoder_name = get_encoder_name()
+    losses_cfg = get_losses()
 
     df = create_df(data_path, control_path or None, control_balance_ratio)
     print("Total Images: ", len(df))
@@ -742,7 +895,7 @@ def run_experiment(
         torch.manual_seed(i)
         np.random.seed(i)
 
-        losses = eval(get_losses())
+        losses = eval(losses_cfg)
         model_params = get_model_params().copy()
         resolved_out_channels = resolve_model_out_channels(losses, model_params.get("out_channels", 1))
         if resolved_out_channels != model_params.get("out_channels", 1):
@@ -752,7 +905,7 @@ def run_experiment(
             )
             model_params["out_channels"] = resolved_out_channels
 
-        model = create_model(get_model_name(), get_encoder_name(), model_params)
+        model = create_model(model_name, encoder_name, model_params)
         optimizer = torch.optim.Adam(model.parameters(), lr=max_lr, weight_decay=weight_decay)
 
         t_train = build_monai_transforms(height, width, train=True, use_extra_augmentations=use_extra_augmentations)
@@ -763,8 +916,14 @@ def run_experiment(
         val_df = df.loc[X_val].reset_index()
         val_set = TVUSMONAIDataset(val_df, t_val)
 
-        train_loader = DataLoader(train_set, batch_size=2, shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_set, batch_size=1, shuffle=False, drop_last=False)
+        # batch_size=2 fits 512x768 models on ~16–24GB GPUs; with 24GB VRAM you can try 4
+        # for lighter models (AttentionUnet / BasicUNet). pin_memory helps host→GPU copies.
+        train_loader = DataLoader(
+            train_set, batch_size=2, shuffle=True, drop_last=True, pin_memory=torch.cuda.is_available()
+        )
+        val_loader = DataLoader(
+            val_set, batch_size=1, shuffle=False, drop_last=False, pin_memory=torch.cuda.is_available()
+        )
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -791,19 +950,61 @@ def run_experiment(
             val_df,
         )
 
-    best_iou_scores = np.array(list(best_iou_scores.values()))
-    best_nsd_scores = np.array(list(best_nsd_scores.values()))
-    best_dice_scores = np.array(list(best_dice_scores.values()))
-    print(f"TOTAL AVERAGE CV mIOU: {np.nanmean(best_iou_scores)}")
-    print(f"TOTAL AVERAGE CV NSD: {np.nanmean(best_nsd_scores)}")
-    print(f"TOTAL AVERAGE CV Dice: {np.nanmean(best_dice_scores)}")
+        append_experiment_result(
+            results_csv,
+            _experiment_result_row(
+                _run,
+                model_name,
+                encoder_name,
+                losses_cfg,
+                use_extra_augmentations,
+                model_output,
+                fold=i,
+                miou=best_iou_scores.get(i),
+                nsd=best_nsd_scores.get(i),
+                dice=best_dice_scores.get(i),
+                n_folds=1,
+                status="fold_complete",
+            ),
+        )
 
-    _run.log_scalar("average.mIoU", float(np.nanmean(best_iou_scores)))
-    _run.log_scalar("average.NSD", float(np.nanmean(best_nsd_scores)))
-    _run.log_scalar("average.Dice", float(np.nanmean(best_dice_scores)))
-    _run.log_scalar("std.mIoU", float(np.nanstd(best_iou_scores)))
-    _run.log_scalar("std.NSD", float(np.nanstd(best_nsd_scores)))
-    _run.log_scalar("std.Dice", float(np.nanstd(best_dice_scores)))
+    agg = _aggregate_fold_metrics(best_iou_scores, best_nsd_scores, best_dice_scores)
+    print(f"TOTAL AVERAGE CV mIOU: {agg['miou']}")
+    print(f"TOTAL AVERAGE CV NSD: {agg['nsd']}")
+    print(f"TOTAL AVERAGE CV Dice: {agg['dice']}")
+    print(
+        f"CV std (n_folds={agg['n_folds']}): "
+        f"mIoU={agg['miou_std']:.6f}, NSD={agg['nsd_std']:.6f}, Dice={agg['dice_std']:.6f}"
+    )
+
+    _run.log_scalar("average.mIoU", agg["miou"])
+    _run.log_scalar("average.NSD", agg["nsd"])
+    _run.log_scalar("average.Dice", agg["dice"])
+    _run.log_scalar("std.mIoU", agg["miou_std"])
+    _run.log_scalar("std.NSD", agg["nsd_std"])
+    _run.log_scalar("std.Dice", agg["dice_std"])
+
+    # One analytics row per sacred run: cross-fold mean in miou/nsd/dice, std in *_std.
+    append_experiment_result(
+        results_csv,
+        _experiment_result_row(
+            _run,
+            model_name,
+            encoder_name,
+            losses_cfg,
+            use_extra_augmentations,
+            model_output,
+            fold="total",
+            miou=agg["miou"],
+            nsd=agg["nsd"],
+            dice=agg["dice"],
+            miou_std=agg["miou_std"],
+            nsd_std=agg["nsd_std"],
+            dice_std=agg["dice_std"],
+            n_folds=agg["n_folds"],
+            status="run_total",
+        ),
+    )
 
 
 LOSS_PRESETS = {
@@ -868,6 +1069,7 @@ def _common_run_kwargs(args):
         "control_path": args.control_path or "",
         "control_balance_ratio": args.control_balance_ratio,
         "csv_output": args.csv_output,
+        "results_csv": args.results_csv,
         "sacred_runs": args.sacred_runs,
         "dataset_name": args.dataset_name,
     }
@@ -919,4 +1121,31 @@ if __name__ == "__main__":
             config_updates["losses"],
             "aug" if config_updates["use_extra_augmentations"] else "noaug",
         )
-        ex.run(config_updates=config_updates)
+        try:
+            ex.run(config_updates=config_updates)
+        except Exception as exc:
+            print(f"Experiment failed: {exc}")
+            traceback.print_exc()
+            append_experiment_result(
+                args.results_csv,
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "sacred_run_id": None,
+                    "model_name": config_updates["model_name"],
+                    "encoder_name": config_updates["encoder_name"] or "default",
+                    "losses": config_updates["losses"],
+                    "use_extra_augmentations": config_updates["use_extra_augmentations"],
+                    "fold": "total",
+                    "n_folds": 0,
+                    "miou": None,
+                    "nsd": None,
+                    "dice": None,
+                    "miou_std": None,
+                    "nsd_std": None,
+                    "dice_std": None,
+                    "model_output": config_updates["model_output"],
+                    "status": f"failed: {exc}",
+                },
+            )
+            print("Continuing with remaining experiment configs...")
+            continue
