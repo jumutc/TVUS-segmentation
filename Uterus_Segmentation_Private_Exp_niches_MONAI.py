@@ -1101,7 +1101,7 @@ MODEL_PRESETS = {
         "encoder_name": "",
         "model_params": {
             "in_channels": 3,
-            "features": (64, 128, 256, 512, 1024, 128),
+            "features": (16, 32, 64, 128, 256, 32),
             "deep_supervision": False,
         },
     },
@@ -1109,7 +1109,7 @@ MODEL_PRESETS = {
         "encoder_name": "",
         "model_params": {
             "in_channels": 3,
-            "features": (64, 128, 256, 512, 1024, 128),
+            "features": (16, 32, 64, 128, 256, 32),
         },
     },
     "AttentionUnet": {
