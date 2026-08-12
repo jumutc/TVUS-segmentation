@@ -115,6 +115,38 @@ def append_experiment_result(results_csv, row):
         print(f"Wrote result to {abs_path}")
 
 
+def load_completed_model_outputs(results_csv):
+    """Return model_output paths that already finished with status run_total."""
+    if not results_csv or not os.path.isfile(results_csv) or os.path.getsize(results_csv) == 0:
+        return set()
+
+    df = pd.read_csv(results_csv)
+    if "status" not in df.columns or "model_output" not in df.columns:
+        return set()
+
+    completed = df.loc[df["status"] == "run_total", "model_output"].dropna().astype(str)
+    return set(completed)
+
+
+def filter_pending_configs(configs, results_csv, rerun_all=False):
+    """Drop configs whose run_total row is already in experiment_results.csv."""
+    if rerun_all:
+        return configs
+
+    completed = load_completed_model_outputs(results_csv)
+    if not completed:
+        return configs
+
+    pending = [config for config in configs if config["model_output"] not in completed]
+    skipped = len(configs) - len(pending)
+    if skipped:
+        print(
+            f"Skipping {skipped} completed experiment(s) recorded in {os.path.abspath(results_csv)} "
+            f"({len(pending)} remaining)"
+        )
+    return pending
+
+
 def _aggregate_fold_metrics(best_iou_scores, best_nsd_scores, best_dice_scores):
     """Mean/std of best fold metrics for a sacred run total row."""
     iou = np.asarray(list(best_iou_scores.values() if isinstance(best_iou_scores, dict) else best_iou_scores), dtype=float)
@@ -230,6 +262,11 @@ def parse_args():
         type=str,
         default="TVUS (private)",
         help="Dataset name for logging (default: TVUS (private))",
+    )
+    parser.add_argument(
+        "--rerun_all",
+        action="store_true",
+        help="Run every config even if experiment_results.csv already has a run_total row",
     )
     return parser.parse_args()
 
@@ -611,12 +648,31 @@ def get_lr(optimizer):
         return param_group["lr"]
 
 
+COMMON_MODEL_PARAMS = {"in_channels", "out_channels", "spatial_dims"}
+MODEL_SPECIFIC_PARAMS = {
+    "FlexibleUNet": {"decoder_channels", "pretrained"},
+    "BasicUNetPlusPlus": {"features", "deep_supervision"},
+    "BasicUNet": {"features"},
+    "AttentionUnet": {"channels", "strides"},
+}
+
+
+def _filter_model_params(model_name, model_params):
+    """Keep only params valid for the requested model.
+
+    Sacred deep-merges nested config dicts, so FlexibleUNet defaults can leak
+    into other model runs when using config_updates.
+    """
+    allowed = COMMON_MODEL_PARAMS | MODEL_SPECIFIC_PARAMS[model_name]
+    return {key: value for key, value in model_params.items() if key in allowed}
+
+
 def create_model(model_name, encoder_name, model_params):
     """Create a MONAI segmentation model based on configuration."""
     if model_name not in MONAI_MODELS:
         raise ValueError(f"Unsupported model_name '{model_name}'. Choose from {sorted(MONAI_MODELS)}")
 
-    params = model_params.copy()
+    params = _filter_model_params(model_name, model_params)
     in_channels = params.pop("in_channels", 3)
     out_channels = params.pop("out_channels", 1)
     spatial_dims = params.pop("spatial_dims", 2)
@@ -817,8 +873,6 @@ def config():
     model_params = {
         "in_channels": 3,
         "out_channels": 1,
-        "pretrained": True,
-        "decoder_channels": (256, 128, 64, 32, 16),
     }
     data_path = ""
     control_path = ""
@@ -1113,7 +1167,17 @@ if __name__ == "__main__":
 
     ex.observers.append(FileStorageObserver(args.sacred_runs))
 
-    for config_updates in build_experiment_configs(args):
+    experiment_configs = filter_pending_configs(
+        build_experiment_configs(args),
+        args.results_csv,
+        rerun_all=args.rerun_all,
+    )
+
+    if not experiment_configs:
+        print(f"All experiment configs are already recorded in {os.path.abspath(args.results_csv)}.")
+        raise SystemExit(0)
+
+    for config_updates in experiment_configs:
         print(
             "Running experiment:",
             config_updates["model_name"],
