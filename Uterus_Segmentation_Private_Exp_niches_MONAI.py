@@ -1089,7 +1089,8 @@ LOSS_PRESETS = {
 }
 
 MODEL_PRESETS = {
-    "FlexibleUNet": {
+    "FlexibleUNet_pretrained": {
+        "model_name": "FlexibleUNet",
         "encoder_name": "efficientnet-b7",
         "model_params": {
             "in_channels": 3,
@@ -1097,7 +1098,8 @@ MODEL_PRESETS = {
             "decoder_channels": (256, 128, 64, 32, 16),
         },
     },
-    "FlexibleUNet_raw": {
+    "FlexibleUNet_scratch": {
+        "model_name": "FlexibleUNet",
         "encoder_name": "efficientnet-b7",
         "model_params": {
             "in_channels": 3,
@@ -1106,6 +1108,7 @@ MODEL_PRESETS = {
         },
     },
     "AttentionUnet": {
+        "model_name": "AttentionUnet",
         "encoder_name": "",
         "model_params": {
             "in_channels": 3,
@@ -1116,13 +1119,13 @@ MODEL_PRESETS = {
 }
 
 
-def get_model_output_path(base_path, model_name, encoder_name, has_aug, loss_name=""):
+def get_model_output_path(base_path, preset_name, encoder_name, has_aug, loss_name=""):
     """Generate a unique model output path with postfix."""
     base_name, ext = os.path.splitext(base_path)
     aug_suffix = "_aug" if has_aug else "_noaug"
     encoder_suffix = encoder_name or "default"
     loss_suffix = loss_name or "loss"
-    postfix = f"_{model_name}_{encoder_suffix}_{loss_suffix}{aug_suffix}"
+    postfix = f"_{preset_name}_{encoder_suffix}_{loss_suffix}{aug_suffix}"
     return f"{base_name}{postfix}{ext}"
 
 
@@ -1143,7 +1146,8 @@ def build_experiment_configs(args):
     common = _common_run_kwargs(args)
     configs = []
 
-    for model_name, model_preset in MODEL_PRESETS.items():
+    for preset_name, model_preset in MODEL_PRESETS.items():
+        model_name = model_preset["model_name"]
         encoder_name = model_preset["encoder_name"]
         for loss_name, loss_preset in LOSS_PRESETS.items():
             model_params = model_preset["model_params"].copy()
@@ -1160,7 +1164,7 @@ def build_experiment_configs(args):
                         "use_extra_augmentations": use_extra_augmentations,
                         "model_output": get_model_output_path(
                             args.model_output,
-                            model_name,
+                            preset_name,
                             encoder_name,
                             use_extra_augmentations,
                             loss_name,
@@ -1191,6 +1195,9 @@ if __name__ == "__main__":
             "Running experiment:",
             config_updates["model_name"],
             config_updates["encoder_name"] or "default",
+            f"pretrained={config_updates['model_params'].get('pretrained')}"
+            if config_updates["model_name"] == "FlexibleUNet"
+            else "",
             config_updates["losses"],
             "aug" if config_updates["use_extra_augmentations"] else "noaug",
         )
