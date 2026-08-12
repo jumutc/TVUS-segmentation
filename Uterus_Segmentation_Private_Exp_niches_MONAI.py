@@ -1097,19 +1097,12 @@ MODEL_PRESETS = {
             "decoder_channels": (256, 128, 64, 32, 16),
         },
     },
-    "BasicUNetPlusPlus": {
-        "encoder_name": "",
+    "FlexibleUNet_raw": {
+        "encoder_name": "efficientnet-b7",
         "model_params": {
             "in_channels": 3,
-            "features": (16, 32, 64, 128, 256, 32),
-            "deep_supervision": False,
-        },
-    },
-    "BasicUNet": {
-        "encoder_name": "",
-        "model_params": {
-            "in_channels": 3,
-            "features": (16, 32, 64, 128, 256, 32),
+            "pretrained": False,
+            "decoder_channels": (256, 128, 64, 32, 16),
         },
     },
     "AttentionUnet": {
