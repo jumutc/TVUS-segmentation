@@ -731,6 +731,18 @@ def create_model(model_name, encoder_name, model_params):
     raise ValueError(f"Model factory missing implementation for {model_name}")
 
 
+def _model_outputs(output):
+    """Normalize model forward pass to a list of prediction tensors."""
+    if isinstance(output, (list, tuple)):
+        return output
+    return [output]
+
+
+def _primary_model_output(output):
+    """Return the main segmentation logits (BasicUNetPlusPlus wraps output in a list)."""
+    return _model_outputs(output)[0]
+
+
 def fit(
     _run,
     epochs,
@@ -772,10 +784,12 @@ def fit(
             image = image.to(device)
             mask = mask.to(device)
 
-            output = model(image)
+            raw_output = model(image)
+            output = _primary_model_output(raw_output)
             loss = 0
             for _loss in losses:
-                loss += _loss(output, mask)
+                for head_output in _model_outputs(raw_output):
+                    loss += _loss(head_output, mask)
 
             loss.backward()
             optimizer.step()
@@ -797,11 +811,13 @@ def fit(
 
                     image = image.to(device)
                     mask = mask.to(device)
-                    output = model(image)
+                    raw_output = model(image)
+                    output = _primary_model_output(raw_output)
                     val_metrics.update(output, val_df, idx, device)
 
                     for _loss in losses:
-                        test_loss += _loss(output, mask).item()
+                        for head_output in _model_outputs(raw_output):
+                            test_loss += _loss(head_output, mask).item()
 
             train_losses.append(running_loss / len(train_loader))
             test_losses.append(test_loss / len(val_loader))
