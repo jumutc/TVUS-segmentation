@@ -11,6 +11,7 @@ Key differences:
 - Uses a separate control_path for unlabeled control videos (negative samples)
 - Uses MONAI transforms for preprocessing and augmentation (with optional extra augmentations)
 - Preserves the same data loading, GroupShuffleSplit CV, Sacred logging, and MONAI GPU metrics
+- CLI selects CV fold count (--n_splits) and model presets by number (--model_presets 1,2,3)
 
 Requirements:
 - monai: pip install monai
@@ -268,7 +269,26 @@ def parse_args():
         action="store_true",
         help="Run every config even if experiment_results.csv already has a run_total row",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--n_splits",
+        type=int,
+        default=3,
+        help="Number of GroupShuffleSplit training folds (default: 3)",
+    )
+    parser.add_argument(
+        "--model_presets",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated model preset numbers to run, e.g. 1,2,3. "
+            f"Available: {_format_model_preset_choices()}. Default: all presets."
+        ),
+    )
+    args = parser.parse_args()
+    if args.n_splits < 1:
+        parser.error("--n_splits must be >= 1")
+    args.selected_model_presets = _resolve_model_presets(args.model_presets)
+    return args
 
 
 def _is_niche_class(class_title):
@@ -899,6 +919,7 @@ def config():
     sacred_runs = "uterus_runs_monai"
     dataset_name = "TVUS (private)"
     use_extra_augmentations = False
+    n_splits = 3
 
 
 @ex.capture
@@ -936,6 +957,7 @@ def run_experiment(
     csv_input,
     results_csv,
     use_extra_augmentations,
+    n_splits,
 ):
     max_lr = 1e-4
     epochs = 200
@@ -952,9 +974,10 @@ def run_experiment(
     print("Total Images: ", len(df))
     print(df.head())
     df[["volume_id", "video_path", "frame_idx"]].to_csv(csv_input, index=False)
+    print(f"Using n_splits={n_splits}")
 
     for i, (X_train, X_val) in enumerate(
-        GroupShuffleSplit(n_splits=3, test_size=0.15, random_state=0).split(df.index, groups=df["volume_id"])
+        GroupShuffleSplit(n_splits=n_splits, test_size=0.15, random_state=0).split(df.index, groups=df["volume_id"])
     ):
         print("Train Size   : ", len(X_train))
         print("Val Size     : ", len(X_val))
@@ -1119,6 +1142,51 @@ MODEL_PRESETS = {
 }
 
 
+def _numbered_model_presets():
+    """Map 1-based indices to MODEL_PRESETS insertion order."""
+    return list(MODEL_PRESETS.items())
+
+
+def _format_model_preset_choices():
+    return ", ".join(f"{i}={name}" for i, (name, _) in enumerate(_numbered_model_presets(), start=1))
+
+
+def _resolve_model_presets(selection):
+    """Resolve CLI preset numbers (e.g. '1,2,3') to MODEL_PRESETS names.
+
+    Empty/None selection runs every preset. Numbers are 1-based and follow
+    MODEL_PRESETS order.
+    """
+    numbered = _numbered_model_presets()
+    if selection is None or str(selection).strip() == "" or str(selection).strip().lower() == "all":
+        return [name for name, _ in numbered]
+
+    tokens = [tok.strip() for tok in str(selection).replace(" ", ",").split(",") if tok.strip()]
+    if not tokens:
+        raise SystemExit(
+            f"No model presets selected. Available: {_format_model_preset_choices()}"
+        )
+
+    selected = []
+    seen = set()
+    for tok in tokens:
+        if not tok.isdigit():
+            raise SystemExit(
+                f"Invalid model preset '{tok}'. Use numbers, e.g. 1,2,3. "
+                f"Available: {_format_model_preset_choices()}"
+            )
+        idx = int(tok)
+        if idx < 1 or idx > len(numbered):
+            raise SystemExit(
+                f"Model preset {idx} is out of range. Available: {_format_model_preset_choices()}"
+            )
+        name, _ = numbered[idx - 1]
+        if name not in seen:
+            selected.append(name)
+            seen.add(name)
+    return selected
+
+
 def get_model_output_path(base_path, preset_name, encoder_name, has_aug, loss_name=""):
     """Generate a unique model output path with postfix."""
     base_name, ext = os.path.splitext(base_path)
@@ -1138,15 +1206,23 @@ def _common_run_kwargs(args):
         "results_csv": args.results_csv,
         "sacred_runs": args.sacred_runs,
         "dataset_name": args.dataset_name,
+        "n_splits": args.n_splits,
     }
 
 
 def build_experiment_configs(args):
-    """Build Sacred config updates for every model × loss × augmentation combination."""
+    """Build Sacred config updates for every selected model × loss × augmentation combination."""
     common = _common_run_kwargs(args)
     configs = []
+    name_to_idx = {name: idx for idx, (name, _) in enumerate(_numbered_model_presets(), start=1)}
+    selected_labels = ", ".join(
+        f"{name_to_idx[name]}={name}" for name in args.selected_model_presets
+    )
+    print(f"n_splits={args.n_splits}")
+    print(f"Selected model presets: {selected_labels}")
 
-    for preset_name, model_preset in MODEL_PRESETS.items():
+    for preset_name in args.selected_model_presets:
+        model_preset = MODEL_PRESETS[preset_name]
         model_name = model_preset["model_name"]
         encoder_name = model_preset["encoder_name"]
         for loss_name, loss_preset in LOSS_PRESETS.items():
@@ -1178,6 +1254,8 @@ def build_experiment_configs(args):
 if __name__ == "__main__":
     args = parse_args()
 
+    print(f"Available model presets: {_format_model_preset_choices()}")
+
     ex.observers.append(FileStorageObserver(args.sacred_runs))
 
     experiment_configs = filter_pending_configs(
@@ -1200,6 +1278,7 @@ if __name__ == "__main__":
             else "",
             config_updates["losses"],
             "aug" if config_updates["use_extra_augmentations"] else "noaug",
+            f"n_splits={config_updates['n_splits']}",
         )
         try:
             ex.run(config_updates=config_updates)
