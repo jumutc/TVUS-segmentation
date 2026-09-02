@@ -18,6 +18,13 @@ with a shared frame are compared instead (e.g. Repeat 2 vs Repeat 3 only).
 
 Additional consistency statistics (std, variance, range, mask-area CV) are
 reported per video and in aggregate summaries.
+
+When --inter-observer-csv is provided, repeat sessions (R1/R2/R3) are also
+compared to the original inter-observer study: precomputed observer-observer
+pairwise metrics are loaded from the CSV, and repeat-vs-observer metrics are
+computed from Supervisely annotations. Friedman and paired tests compare R1,
+R2, and R3 agreement with observers; intra- vs inter-observer variability is
+tested on matched videos.
 """
 
 import argparse
@@ -388,6 +395,234 @@ def _short_pair_label(repeat_pair):
     return re.sub(r'[^\w.\-]+', '_', repeat_pair).strip('_')
 
 
+def _repeat_short_label(repeat_label):
+    """Map a repeat folder label to R1/R2/R3 when possible."""
+    match = REPEAT_DIR_PATTERN.search(repeat_label)
+    if match:
+        return f"R{match.group(1)}"
+    return repeat_label
+
+
+def _observer_from_annotation_label(label):
+    """Strip frame suffix: Britt/frame235 -> Britt."""
+    return str(label).split('/', 1)[0].strip()
+
+
+def _build_repeat_ann_index(repeat_datasets):
+    per_repeat_ann = {}
+    for ds in repeat_datasets:
+        label = ds['repeat_label']
+        per_repeat_ann[label] = {
+            f.name: f for f in sorted(ds['ann_dir'].glob('*.json'))
+        }
+    common_json_names = set.intersection(
+        *(set(files.keys()) for files in per_repeat_ann.values())
+    )
+    return per_repeat_ann, common_json_names
+
+
+def discover_inter_observer_annotations(inter_root):
+    """Map expert name -> {annotation_json_name: path}."""
+    annotators_dir = Path(inter_root) / 'annotators'
+    if not annotators_dir.is_dir():
+        raise ValueError(f"Inter-observer annotators folder not found: {annotators_dir}")
+
+    per_expert_files = {}
+    for expert_dir in sorted(d for d in annotators_dir.iterdir() if d.is_dir()):
+        ann_dir = expert_dir / 'ann'
+        if not ann_dir.is_dir():
+            print(f"Warning: no ann/ folder for expert {expert_dir.name}, skipping")
+            continue
+        per_expert_files[expert_dir.name] = {
+            f.name: f for f in sorted(ann_dir.glob('*.json'))
+        }
+    if len(per_expert_files) < 2:
+        raise ValueError(
+            f"Need at least 2 experts with ann/ folders under {annotators_dir}"
+        )
+    return per_expert_files
+
+
+def load_inter_observer_comparison(csv_path):
+    """Load precomputed inter-observer pairwise metrics."""
+    df = pd.read_csv(csv_path)
+    required = {'video', 'frame_index', 'annotation_a', 'annotation_b', *METRIC_COLS}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{csv_path} missing columns: {sorted(missing)}")
+
+    df = df.copy()
+    df['observer_a'] = df['annotation_a'].map(_observer_from_annotation_label)
+    df['observer_b'] = df['annotation_b'].map(_observer_from_annotation_label)
+    return df
+
+
+def compute_repeat_vs_observer_comparisons(
+    repeat_datasets,
+    inter_df,
+    inter_ann_files,
+    frame_measurements,
+):
+    """
+    Compare each repeat annotation to each inter-observer expert on the
+    inter-study frame index for overlapping videos.
+    """
+    per_repeat_ann, common_json_names = _build_repeat_ann_index(repeat_datasets)
+    inter_videos = set(inter_df['video'].unique())
+    rows = []
+    skipped = []
+
+    for json_name in sorted(common_json_names):
+        video_name = _video_name_from_annotation_json(json_name)
+        if video_name not in inter_videos:
+            continue
+
+        inter_video = inter_df[inter_df['video'] == video_name]
+        frame_index = int(inter_video['frame_index'].iloc[0])
+        nsd_tau = get_nsd_tau_for_video(video_name, frame_measurements)
+        observers = sorted(
+            set(inter_video['observer_a']) | set(inter_video['observer_b'])
+        )
+
+        repeat_masks = {}
+        for repeat_label, files in per_repeat_ann.items():
+            ann_path = files.get(json_name)
+            if ann_path is None:
+                continue
+            annotation = load_supervisely_annotation(ann_path)
+            if frame_index not in get_niche_frame_indices(annotation):
+                continue
+            repeat_masks[_repeat_short_label(repeat_label)] = (
+                extract_niche_mask_at_frame(annotation, frame_index)
+            )
+
+        if not repeat_masks:
+            skipped.append({
+                'video': video_name,
+                'reason': f'no repeat annotation at inter-observer frame {frame_index}',
+            })
+            continue
+
+        for repeat_short, repeat_mask in repeat_masks.items():
+            for observer in observers:
+                observer_files = inter_ann_files.get(observer)
+                if not observer_files:
+                    continue
+                obs_ann_path = observer_files.get(json_name)
+                if obs_ann_path is None:
+                    continue
+                obs_ann = load_supervisely_annotation(obs_ann_path)
+                if frame_index not in get_niche_frame_indices(obs_ann):
+                    continue
+                obs_mask = extract_niche_mask_at_frame(obs_ann, frame_index)
+                metrics = compute_segmentation_metrics(
+                    repeat_mask, obs_mask, nsd_tau=nsd_tau,
+                )
+                rows.append({
+                    'video': video_name,
+                    'frame_index': frame_index,
+                    'repeat': repeat_short,
+                    'observer': observer,
+                    'repeat_observer_pair': f"{repeat_short} vs {observer}",
+                    'nsd_tau': nsd_tau,
+                    **metrics,
+                })
+
+    return pd.DataFrame(rows), skipped
+
+
+def build_variability_per_video(pairwise_df, inter_df):
+    """Per-video mean pairwise metrics for intra- and inter-observer studies."""
+    intra_rows = []
+    for video, group in pairwise_df.groupby('video', sort=True):
+        row = {
+            'video': video,
+            'study': 'intra_observer',
+            'n_pairs': len(group),
+        }
+        for metric in METRIC_COLS:
+            row[f'{metric}_mean'] = group[metric].mean()
+            row[f'{metric}_std'] = (
+                group[metric].std(ddof=1) if len(group) > 1 else 0.0
+            )
+        intra_rows.append(row)
+    intra_df = pd.DataFrame(intra_rows)
+
+    inter_rows = []
+    for video, group in inter_df.groupby('video', sort=True):
+        row = {
+            'video': video,
+            'study': 'inter_observer',
+            'frame_index': int(group['frame_index'].iloc[0]),
+            'n_pairs': len(group),
+        }
+        for metric in METRIC_COLS:
+            row[f'{metric}_mean'] = group[metric].mean()
+            row[f'{metric}_std'] = (
+                group[metric].std(ddof=1) if len(group) > 1 else 0.0
+            )
+        inter_rows.append(row)
+    inter_summary_df = pd.DataFrame(inter_rows)
+
+    merged = intra_df.merge(
+        inter_summary_df,
+        on='video',
+        suffixes=('_intra', '_inter'),
+        how='inner',
+    )
+    return merged, intra_df, inter_summary_df
+
+
+def build_repeat_vs_observer_summary(repeat_vs_observer_df):
+    """Mean +/- std per repeat (averaged over observers) and overall total."""
+    rows = []
+    for repeat_short, group in repeat_vs_observer_df.groupby('repeat', sort=True):
+        row = {
+            'repeat': repeat_short,
+            'n_videos': group['video'].nunique(),
+            'n_pairs': len(group),
+        }
+        for metric in METRIC_COLS:
+            row[f'{metric}_mean'] = group[metric].mean()
+            row[f'{metric}_std'] = (
+                group[metric].std(ddof=1) if len(group) > 1 else 0.0
+            )
+        rows.append(row)
+
+    total = {
+        'repeat': 'TOTAL',
+        'n_videos': repeat_vs_observer_df['video'].nunique(),
+        'n_pairs': len(repeat_vs_observer_df),
+    }
+    for metric in METRIC_COLS:
+        total[f'{metric}_mean'] = repeat_vs_observer_df[metric].mean()
+        total[f'{metric}_std'] = (
+            repeat_vs_observer_df[metric].std(ddof=1)
+            if len(repeat_vs_observer_df) > 1 else 0.0
+        )
+    rows.append(total)
+    return pd.DataFrame(rows)
+
+
+def build_repeat_vs_observer_per_video(repeat_vs_observer_df):
+    """Per-video mean metric for each repeat vs all observers."""
+    rows = []
+    grouped = repeat_vs_observer_df.groupby(['video', 'repeat'], sort=True)
+    for (video, repeat_short), group in grouped:
+        row = {
+            'video': video,
+            'repeat': repeat_short,
+            'frame_index': int(group['frame_index'].iloc[0]),
+            'n_observers': group['observer'].nunique(),
+        }
+        for metric in METRIC_COLS:
+            stats_row = _metric_stats(group[metric].tolist())
+            row[f'{metric}_mean'] = stats_row['mean']
+            row[f'{metric}_std'] = stats_row['std']
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _metric_wide_by_video(pairwise_df, metric):
     return pairwise_df.pivot_table(
         index='video', columns='repeat_pair', values=metric, aggfunc='first',
@@ -431,6 +666,39 @@ def paired_ttest(sample_a, sample_b) -> dict:
     }
 
 
+def welch_ttest(sample_a, sample_b) -> dict:
+    """Two-sided Welch t-test (unequal variances)."""
+    a = pd.Series(sample_a, dtype=float).dropna()
+    b = pd.Series(sample_b, dtype=float).dropna()
+    if len(a) < 2 or len(b) < 2:
+        return {
+            'n_a': int(len(a)),
+            'n_b': int(len(b)),
+            'mean_a': float(a.mean()) if len(a) else float('nan'),
+            'mean_b': float(b.mean()) if len(b) else float('nan'),
+            'std_a': float(a.std(ddof=1)) if len(a) > 1 else float('nan'),
+            'std_b': float(b.std(ddof=1)) if len(b) > 1 else float('nan'),
+            't_statistic': float('nan'),
+            'p_value': float('nan'),
+            'df': float('nan'),
+        }
+
+    result = stats.ttest_ind(a, b, equal_var=False, alternative='two-sided')
+    return {
+        'n_a': int(len(a)),
+        'n_b': int(len(b)),
+        'mean_a': float(a.mean()),
+        'mean_b': float(b.mean()),
+        'std_a': float(a.std(ddof=1)),
+        'std_b': float(b.std(ddof=1)),
+        't_statistic': float(result.statistic),
+        'p_value': float(result.pvalue),
+        'df': float(result.df),
+        'mean_diff': float(a.mean() - b.mean()),
+        'std_diff': float('nan'),
+    }
+
+
 def _ttest_row(test_type, metric, group_a, group_b, stats_row, test_method):
     row = {
         'test_type': test_type,
@@ -451,6 +719,94 @@ def _ttest_row(test_type, metric, group_a, group_b, stats_row, test_method):
         'alternative': 'two-sided',
     }
     return row
+
+
+def build_repeat_vs_observer_ttests(repeat_vs_observer_per_video_df):
+    """
+    Friedman / paired tests on per-video repeat-vs-observer means (R1, R2, R3).
+    """
+    rows = []
+    if repeat_vs_observer_per_video_df.empty:
+        return pd.DataFrame(rows)
+
+    repeat_labels = sorted(repeat_vs_observer_per_video_df['repeat'].unique())
+    for metric in METRIC_COLS:
+        value_col = f'{metric}_mean'
+        wide = repeat_vs_observer_per_video_df.pivot_table(
+            index='video', columns='repeat', values=value_col, aggfunc='first',
+        )
+
+        for repeat_a, repeat_b in combinations(repeat_labels, 2):
+            if repeat_a not in wide.columns or repeat_b not in wide.columns:
+                continue
+            matched = wide[[repeat_a, repeat_b]].dropna()
+            stats_row = paired_ttest(matched[repeat_a], matched[repeat_b])
+            rows.append(_ttest_row(
+                'repeat_vs_observer_paired', metric, repeat_a, repeat_b,
+                stats_row, 'paired',
+            ))
+
+        available_cols = [r for r in repeat_labels if r in wide.columns]
+        complete = wide[available_cols].dropna()
+        if len(available_cols) >= 3 and len(complete) >= 2:
+            friedman = stats.friedmanchisquare(
+                *[complete[col] for col in available_cols]
+            )
+            rows.append({
+                'test_type': 'repeat_vs_observer_omnibus',
+                'test_method': 'friedman',
+                'metric': metric,
+                'group_a': '; '.join(available_cols),
+                'group_b': '',
+                'n_paired': len(complete),
+                'mean_a': float('nan'),
+                'mean_b': float('nan'),
+                'std_a': float('nan'),
+                'std_b': float('nan'),
+                'mean_diff': float('nan'),
+                'std_diff': float('nan'),
+                't_statistic': float(friedman.statistic),
+                'df': float('nan'),
+                'p_value': float(friedman.pvalue),
+                'alternative': 'two-sided',
+            })
+
+    return pd.DataFrame(rows)
+
+
+def build_intra_vs_inter_ttests(variability_df, pairwise_df, inter_df):
+    """
+    Compare intra-observer vs inter-observer variability on matched videos.
+
+    Uses per-video mean pairwise metrics (paired) and pooled pairwise values
+    across all overlapping videos (Welch).
+    """
+    rows = []
+    overlap_videos = set(variability_df['video'])
+    inter_overlap = inter_df[inter_df['video'].isin(overlap_videos)]
+    intra_overlap = pairwise_df[pairwise_df['video'].isin(overlap_videos)]
+
+    for metric in METRIC_COLS:
+        stats_row = paired_ttest(
+            variability_df[f'{metric}_mean_intra'],
+            variability_df[f'{metric}_mean_inter'],
+        )
+        rows.append(_ttest_row(
+            'intra_vs_inter_variability_paired', metric,
+            'intra_observer', 'inter_observer', stats_row, 'paired',
+        ))
+
+        welch_row = welch_ttest(
+            intra_overlap[metric].tolist(),
+            inter_overlap[metric].tolist(),
+        )
+        rows.append(_ttest_row(
+            'intra_vs_inter_variability_welch', metric,
+            'intra_observer_pairwise', 'inter_observer_pairwise',
+            welch_row, 'welch',
+        ))
+
+    return pd.DataFrame(rows)
 
 
 def build_within_study_ttests(pairwise_df):
@@ -531,9 +887,27 @@ def enrich_pair_summary_with_pvalues(pair_summary_df, ttest_df):
     return enriched
 
 
-def build_ttest_results(pairwise_df):
-    """Build within-study significance tests for matched videos."""
-    return build_within_study_ttests(pairwise_df)
+def build_ttest_results(
+    pairwise_df,
+    repeat_vs_observer_per_video_df=None,
+    variability_df=None,
+    inter_df=None,
+):
+    """Build within-study and optional inter-observer significance tests."""
+    parts = [build_within_study_ttests(pairwise_df)]
+    if repeat_vs_observer_per_video_df is not None and not (
+        repeat_vs_observer_per_video_df.empty
+    ):
+        parts.append(build_repeat_vs_observer_ttests(repeat_vs_observer_per_video_df))
+    if (
+        variability_df is not None
+        and inter_df is not None
+        and not variability_df.empty
+    ):
+        parts.append(build_intra_vs_inter_ttests(
+            variability_df, pairwise_df, inter_df,
+        ))
+    return pd.concat([df for df in parts if not df.empty], ignore_index=True)
 
 
 def _ttest_output_path(output_path):
@@ -541,19 +915,42 @@ def _ttest_output_path(output_path):
     return path.with_name(f"{path.stem}_ttest{path.suffix}")
 
 
+def _output_path_with_suffix(output_path, suffix):
+    path = Path(output_path)
+    return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+
+
 def _print_ttest_block(ttest_df):
     if ttest_df.empty:
         return
 
+    section_titles = {
+        'repeat_pair_paired': 'Within-study (repeat vs repeat)',
+        'repeat_pairs_omnibus': 'Within-study (repeat vs repeat)',
+        'repeat_vs_observer_paired': 'Repeat vs inter-observer experts',
+        'repeat_vs_observer_omnibus': 'Repeat vs inter-observer experts',
+        'intra_vs_inter_variability_paired': 'Intra vs inter variability',
+        'intra_vs_inter_variability_welch': 'Intra vs inter variability',
+    }
+
     print('-' * 72)
-    print('Within-study significance tests (matched videos):')
-    for test_type in sorted(ttest_df['test_type'].unique()):
+    seen_sections = []
+    for test_type in ttest_df['test_type'].unique():
+        title = section_titles.get(test_type, test_type)
+        if title not in seen_sections:
+            print(f'{title}:')
+            seen_sections.append(title)
         subset = ttest_df[ttest_df['test_type'] == test_type]
-        print(f"  [{test_type}]")
         for _, row in subset.iterrows():
-            if row['test_type'] == 'repeat_pairs_omnibus':
+            if row['test_type'] in (
+                'repeat_pairs_omnibus', 'repeat_vs_observer_omnibus',
+            ):
+                scope = (
+                    'repeat pairs' if row['test_type'] == 'repeat_pairs_omnibus'
+                    else 'R1/R2/R3 vs observers'
+                )
                 print(
-                    f"    {row['metric'].upper():>4}  Friedman across repeat pairs "
+                    f"    {row['metric'].upper():>4}  Friedman across {scope} "
                     f"(n={int(row['n_paired'])}): "
                     f"chi2={row['t_statistic']:.4f}, "
                     f"p={row['p_value']:.6g}"
@@ -561,14 +958,50 @@ def _print_ttest_block(ttest_df):
                 continue
 
             label = f"{row['group_a']} vs {row['group_b']}"
+            diff_text = (
+                f", diff={row['mean_diff']:.4f}"
+                if pd.notna(row.get('mean_diff')) else ''
+            )
             print(
                 f"    {row['metric'].upper():>4}  {label} "
-                f"(n={int(row['n_paired'])}): "
-                f"mean={row['mean_a']:.4f} vs {row['mean_b']:.4f}, "
-                f"diff={row['mean_diff']:.4f}, "
+                f"({row['test_method']}, n={int(row['n_paired'])}): "
+                f"mean={row['mean_a']:.4f} vs {row['mean_b']:.4f}"
+                f"{diff_text}, "
                 f"t={row['t_statistic']:.4f}, df={row['df']:.2f}, "
                 f"p={row['p_value']:.6g}"
             )
+
+
+def _print_repeat_vs_observer_summary(repeat_vs_observer_summary_df):
+    if repeat_vs_observer_summary_df.empty:
+        return
+    print('-' * 72)
+    print('Repeat vs inter-observer experts (mean +/- std):')
+    for _, row in repeat_vs_observer_summary_df.iterrows():
+        print(
+            f"  {row['repeat']:>6}  (n={int(row['n_pairs']):>2})  "
+            f"Dice={row['dice_mean']:.4f} +/- {row['dice_std']:.4f}  "
+            f"NSD={row['nsd_mean']:.4f} +/- {row['nsd_std']:.4f}  "
+            f"IoU={row['iou_mean']:.4f} +/- {row['iou_std']:.4f}"
+        )
+
+
+def _print_variability_comparison(variability_df):
+    if variability_df.empty:
+        return
+    print('-' * 72)
+    print('Intra vs inter per-video mean pairwise metrics (matched videos):')
+    for metric in METRIC_COLS:
+        intra_col = f'{metric}_mean_intra'
+        inter_col = f'{metric}_mean_inter'
+        stats_row = paired_ttest(
+            variability_df[intra_col], variability_df[inter_col],
+        )
+        print(
+            f"  {metric.upper():>4}: intra={stats_row['mean_a']:.4f} "
+            f"vs inter={stats_row['mean_b']:.4f} "
+            f"(n={stats_row['n_a']}, paired p={stats_row['p_value']:.6g})"
+        )
 
 
 def build_consistency_baseline(per_video_df):
@@ -643,7 +1076,15 @@ def _save_group_outputs(masks, entries, group, group_idx, tmp_dir, video_dir):
     return str(group_dir)
 
 
-def _print_summary(pair_summary, per_video_df, baseline_df, skipped, ttest_df=None):
+def _print_summary(
+    pair_summary,
+    per_video_df,
+    baseline_df,
+    skipped,
+    ttest_df=None,
+    repeat_vs_observer_summary_df=None,
+    variability_df=None,
+):
     print('=' * 72)
     print('Pairwise repeat comparison (mean +/- std):')
     for _, row in pair_summary.iterrows():
@@ -676,6 +1117,11 @@ def _print_summary(pair_summary, per_video_df, baseline_df, skipped, ttest_df=No
                 f"+/- {row['cohort_std_across_videos']:.4f} (var={row['cohort_var_across_videos']:.6f}); "
                 f"within-video pair std avg={row['mean_within_video_pair_std']:.4f}"
             )
+
+    if repeat_vs_observer_summary_df is not None:
+        _print_repeat_vs_observer_summary(repeat_vs_observer_summary_df)
+    if variability_df is not None:
+        _print_variability_comparison(variability_df)
 
     if ttest_df is not None:
         _print_ttest_block(ttest_df)
@@ -735,6 +1181,17 @@ def main():
     )
     parser.add_argument(
         '--verbose', action='store_true', default=True,
+    )
+    parser.add_argument(
+        '--inter-observer-csv', type=str, default=None,
+        help='Precomputed inter-observer pairwise comparison CSV '
+             '(default: inter_observer_comparisons_v2/all_niche_results/comparison.csv '
+             'when present)',
+    )
+    parser.add_argument(
+        '--inter-observer-root', type=str, default=None,
+        help='Root folder with annotators/ for inter-observer expert annotations '
+             '(default: measurements-root)',
     )
     args = parser.parse_args()
 
@@ -868,11 +1325,82 @@ def main():
     pair_summary_df = build_pair_summary(pairwise_df)
     baseline_df = build_consistency_baseline(per_video_df)
 
-    ttest_df = build_ttest_results(pairwise_df)
+    repeat_vs_observer_df = pd.DataFrame()
+    repeat_vs_observer_summary_df = pd.DataFrame()
+    repeat_vs_observer_per_video_df = pd.DataFrame()
+    variability_df = pd.DataFrame()
+    inter_overlap_df = pd.DataFrame()
+    inter_skipped = []
+
+    default_inter_csv = (
+        Path('inter_observer_comparisons_v2/all_niche_results/comparison.csv')
+    )
+    inter_csv_path = (
+        Path(args.inter_observer_csv)
+        if args.inter_observer_csv
+        else default_inter_csv
+    )
+    if inter_csv_path.exists():
+        inter_df = load_inter_observer_comparison(inter_csv_path)
+        intra_videos = set(pairwise_df['video'].unique())
+        inter_overlap_df = inter_df[inter_df['video'].isin(intra_videos)].copy()
+        print(
+            f"Loaded inter-observer reference: {len(inter_df)} pairwise rows, "
+            f"{inter_overlap_df['video'].nunique()} videos overlap with intra study"
+        )
+
+        inter_root = Path(args.inter_observer_root or measurements_root)
+        inter_ann_files = discover_inter_observer_annotations(inter_root)
+        repeat_vs_observer_df, inter_skipped = compute_repeat_vs_observer_comparisons(
+            repeat_datasets,
+            inter_overlap_df,
+            inter_ann_files,
+            frame_measurements,
+        )
+        if not repeat_vs_observer_df.empty:
+            repeat_vs_observer_per_video_df = build_repeat_vs_observer_per_video(
+                repeat_vs_observer_df,
+            )
+            repeat_vs_observer_summary_df = build_repeat_vs_observer_summary(
+                repeat_vs_observer_df,
+            )
+            variability_df, _, _ = build_variability_per_video(
+                pairwise_df, inter_overlap_df,
+            )
+            print(
+                f"Computed {len(repeat_vs_observer_df)} repeat-vs-observer pairwise rows "
+                f"({repeat_vs_observer_df['repeat'].nunique()} repeats, "
+                f"{repeat_vs_observer_df['video'].nunique()} videos)"
+            )
+        else:
+            print('Warning: no repeat-vs-observer comparisons computed')
+        if inter_skipped:
+            print(f"Warning: {len(inter_skipped)} video(s) skipped for repeat-vs-observer")
+    else:
+        inter_df = None
+        print(
+            f"Inter-observer CSV not found ({inter_csv_path}); "
+            f"skipping repeat-vs-observer and intra-vs-inter tests"
+        )
+
+    ttest_df = build_ttest_results(
+        pairwise_df,
+        repeat_vs_observer_per_video_df=repeat_vs_observer_per_video_df,
+        variability_df=variability_df if not variability_df.empty else None,
+        inter_df=inter_overlap_df if not inter_overlap_df.empty else None,
+    )
     pair_summary_df = enrich_pair_summary_with_pvalues(pair_summary_df, ttest_df)
 
     print()
-    _print_summary(pair_summary_df, per_video_df, baseline_df, skipped, ttest_df)
+    _print_summary(
+        pair_summary_df,
+        per_video_df,
+        baseline_df,
+        skipped + inter_skipped,
+        ttest_df,
+        repeat_vs_observer_summary_df=repeat_vs_observer_summary_df,
+        variability_df=variability_df,
+    )
 
     if args.output:
         out = Path(args.output)
@@ -880,19 +1408,37 @@ def main():
         per_video_df.to_csv(out.with_name(f"{out.stem}_per_video{out.suffix}"), index=False)
         pair_summary_df.to_csv(_average_output_path(out), index=False)
         baseline_df.to_csv(out.with_name(f"{out.stem}_baseline{out.suffix}"), index=False)
+        saved_paths = [
+            out,
+            out.with_name(f"{out.stem}_per_video{out.suffix}"),
+            _average_output_path(out),
+            out.with_name(f"{out.stem}_baseline{out.suffix}"),
+        ]
         if not ttest_df.empty:
             ttest_path = _ttest_output_path(out)
             ttest_df.to_csv(ttest_path, index=False)
-            print(
-                f"\nSaved:\n  {out}\n  {out.with_name(f'{out.stem}_per_video{out.suffix}')}"
-                f"\n  {_average_output_path(out)}\n  {out.with_name(f'{out.stem}_baseline{out.suffix}')}"
-                f"\n  {ttest_path}"
-            )
-        else:
-            print(
-                f"\nSaved:\n  {out}\n  {out.with_name(f'{out.stem}_per_video{out.suffix}')}"
-                f"\n  {_average_output_path(out)}\n  {out.with_name(f'{out.stem}_baseline{out.suffix}')}"
-            )
+            saved_paths.append(ttest_path)
+        if not repeat_vs_observer_df.empty:
+            rvo_path = _output_path_with_suffix(out, 'repeat_vs_observer')
+            repeat_vs_observer_df.to_csv(rvo_path, index=False)
+            saved_paths.append(rvo_path)
+            rvo_avg_path = _output_path_with_suffix(out, 'repeat_vs_observer_avg')
+            repeat_vs_observer_summary_df.to_csv(rvo_avg_path, index=False)
+            saved_paths.append(rvo_avg_path)
+            rvo_pv_path = _output_path_with_suffix(out, 'repeat_vs_observer_per_video')
+            repeat_vs_observer_per_video_df.to_csv(rvo_pv_path, index=False)
+            saved_paths.append(rvo_pv_path)
+        if not variability_df.empty:
+            var_path = _output_path_with_suffix(out, 'variability')
+            variability_df.to_csv(var_path, index=False)
+            saved_paths.append(var_path)
+        if not inter_overlap_df.empty:
+            inter_path = _output_path_with_suffix(out, 'inter_observer_overlap')
+            inter_overlap_df.to_csv(inter_path, index=False)
+            saved_paths.append(inter_path)
+        print('\nSaved:')
+        for path in saved_paths:
+            print(f'  {path}')
 
 
 if __name__ == '__main__':
