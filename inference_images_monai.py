@@ -6,6 +6,19 @@ project root that contains ``ann/`` JSON files and matching ``video/`` files.
 Each annotated frame is preprocessed with the same MONAI transforms used at
 validation time, then ground-truth and predicted boundaries are overlaid.
 
+Supported layouts (searched recursively):
+
+1. Single dataset export::
+
+       <root>/ann/*.json
+       <root>/video/*.mp4
+
+2. Multi-dataset export (e.g. Niches ``data/annotations``)::
+
+       <root>/meta.json
+       <root>/dataset <timestamp>/ann/*.json
+       <root>/dataset <timestamp>/video/*.mp4
+
 MONAI-specific model outputs are handled the same way as video inference:
 
 - BasicUNetPlusPlus returns a list of tensors; the first head is used
@@ -14,8 +27,13 @@ MONAI-specific model outputs are handled the same way as video inference:
 
 Usage:
     python inference_images_monai.py <model_path> <supervisely_path> [output_dir]
+
+Annotation JSON and matching videos are discovered recursively under the
+Supervisely path. Per-frame Dice, IoU, NSD, and timing metrics are written to
+``<output_dir>/metrics_<model>.csv``.
 """
 
+import csv
 import json
 import os.path
 import sys
@@ -35,12 +53,16 @@ from monai.transforms import (
 )
 from skimage import measure
 from tqdm import tqdm
+from MeshMetrics import DistanceMetrics
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Model input size (from Uterus_Segmentation_Private_Exp_niches_MONAI.py)
 height, width = 512, 768
+
+# Same NSD tolerance (pixels) as MONAI niche training / evaluate_model.py
+NSD_TOLERANCE = 6.0
 
 NICHE_CLASS_NAMES = frozenset({"niche"})
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm")
@@ -152,12 +174,20 @@ def _build_video_index(search_roots):
     return video_index
 
 
-def _resolve_video_path(video_name, video_index, ann_path):
-    if video_name in video_index:
-        return video_index[video_name]
+def _dataset_rel_from_ann_path(ann_path, data_path):
+    """Return dataset folder relative to data_path (parent of ``ann/``), or ''."""
+    dataset_dir = os.path.dirname(os.path.dirname(ann_path))
+    rel = os.path.relpath(dataset_dir, data_path)
+    if rel in (".", os.curdir):
+        return ""
+    return rel
 
+
+def _resolve_video_path(video_name, video_index, ann_path):
+    """Prefer the sibling ``video/`` next to ``ann/``, then fall back to the index."""
     ann_dir = os.path.dirname(ann_path)
     video_dir = os.path.join(os.path.dirname(ann_dir), "video")
+
     candidate = os.path.join(video_dir, video_name)
     if os.path.isfile(candidate):
         return candidate
@@ -167,6 +197,11 @@ def _resolve_video_path(video_name, video_index, ann_path):
         candidate = os.path.join(video_dir, f"{stem}{ext}")
         if os.path.isfile(candidate):
             return candidate
+
+    if video_name in video_index:
+        return video_index[video_name]
+
+    for ext in VIDEO_EXTENSIONS:
         indexed = video_index.get(f"{stem}{ext}")
         if indexed:
             return indexed
@@ -297,6 +332,7 @@ def collect_annotated_samples(data_path):
 
         vw, vh = video_size
         volume_id = os.path.splitext(os.path.basename(video_name))[0]
+        dataset_rel = _dataset_rel_from_ann_path(ann_path, data_path)
         for frame_data in frames:
             frame_idx = int(frame_data["index"])
             mask = _create_mask_from_supervisely_frame(
@@ -315,10 +351,11 @@ def collect_annotated_samples(data_path):
                     "frame_idx": frame_idx,
                     "gt_mask": mask,
                     "volume_id": volume_id,
+                    "dataset_rel": dataset_rel,
                 }
             )
 
-    print(f"Found {len(ann_files)} annotation file(s) under: {data_path}")
+    print(f"Found {len(ann_files)} annotation file(s) under (including subfolders): {data_path}")
     print(f"Collected {len(samples)} annotated frame(s)")
     if missing_videos:
         print(f"Skipped {missing_videos} annotation file(s) with no matching video")
@@ -384,7 +421,41 @@ def binary_iou(gt_mask, pred_mask):
     return float(intersection / union)
 
 
-def process_samples(model, samples, output_dir, model_name):
+def binary_nsd(gt_mask, pred_mask, nsd_tolerance=NSD_TOLERANCE):
+    """Normalized Surface Distance via MeshMetrics (same as evaluate_model.py)."""
+    gt = (np.asarray(gt_mask) > 0).astype(bool)
+    pred = (np.asarray(pred_mask) > 0).astype(bool)
+    if not gt.any() and not pred.any():
+        return 1.0
+    metrics = DistanceMetrics()
+    metrics.set_input(pred, gt, spacing=(1, 1))
+    return float(metrics.nsd(nsd_tolerance))
+
+
+def write_metrics_csv(rows, csv_path):
+    """Write per-frame metrics to CSV."""
+    fieldnames = [
+        "dataset_rel",
+        "volume_id",
+        "video_path",
+        "frame_idx",
+        "dice",
+        "iou",
+        "nsd",
+        "nsd_tau",
+        "preprocessing_ms",
+        "inference_ms",
+        "postprocessing_ms",
+        "overlay_path",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved per-frame metrics CSV to: {csv_path}")
+
+
+def process_samples(model, samples, output_dir, model_name, metrics_csv_path=None):
     """Run inference on annotated frames and write overlay images."""
     grouped = defaultdict(list)
     for sample in samples:
@@ -396,6 +467,8 @@ def process_samples(model, samples, output_dir, model_name):
     postprocessing_times = []
     dice_scores = []
     iou_scores = []
+    nsd_scores = []
+    metric_rows = []
     saved = 0
     skipped_unreadable = 0
 
@@ -422,11 +495,13 @@ def process_samples(model, samples, output_dir, model_name):
                     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                     img_tensor, original_shape = preprocess_frame(frame_rgb)
                     img_tensor = img_tensor.unsqueeze(0).to(device)
-                    preprocessing_times.append(time.time() - preprocess_start)
+                    preprocess_s = time.time() - preprocess_start
+                    preprocessing_times.append(preprocess_s)
 
                     inference_start = time.time()
                     output = model(img_tensor)
-                    inference_times.append(time.time() - inference_start)
+                    inference_s = time.time() - inference_start
+                    inference_times.append(inference_s)
 
                     postprocess_start = time.time()
                     pred_mask = postprocess_mask(output, original_shape)
@@ -438,15 +513,43 @@ def process_samples(model, samples, output_dir, model_name):
                             interpolation=cv2.INTER_NEAREST,
                         )
                     overlay = draw_overlay(frame_bgr, gt_mask, pred_mask)
-                    postprocessing_times.append(time.time() - postprocess_start)
+                    postprocess_s = time.time() - postprocess_start
+                    postprocessing_times.append(postprocess_s)
 
-                    dice_scores.append(binary_dice(gt_mask, pred_mask))
-                    iou_scores.append(binary_iou(gt_mask, pred_mask))
+                    dice = binary_dice(gt_mask, pred_mask)
+                    iou = binary_iou(gt_mask, pred_mask)
+                    nsd = binary_nsd(gt_mask, pred_mask, NSD_TOLERANCE)
+                    dice_scores.append(dice)
+                    iou_scores.append(iou)
+                    nsd_scores.append(nsd)
 
+                    dataset_rel = sample.get("dataset_rel") or ""
                     output_filename = f"{sample['volume_id']}_frame{frame_idx:05d}_{model_name}.png"
-                    output_path = os.path.join(output_dir, output_filename)
+                    if dataset_rel:
+                        sample_out_dir = os.path.join(output_dir, dataset_rel)
+                    else:
+                        sample_out_dir = output_dir
+                    os.makedirs(sample_out_dir, exist_ok=True)
+                    output_path = os.path.join(sample_out_dir, output_filename)
                     cv2.imwrite(output_path, overlay)
                     saved += 1
+
+                    metric_rows.append(
+                        {
+                            "dataset_rel": dataset_rel,
+                            "volume_id": sample["volume_id"],
+                            "video_path": video_path,
+                            "frame_idx": frame_idx,
+                            "dice": dice,
+                            "iou": iou,
+                            "nsd": nsd,
+                            "nsd_tau": NSD_TOLERANCE,
+                            "preprocessing_ms": preprocess_s * 1000.0,
+                            "inference_ms": inference_s * 1000.0,
+                            "postprocessing_ms": postprocess_s * 1000.0,
+                            "overlay_path": output_path,
+                        }
+                    )
             finally:
                 cap.release()
 
@@ -454,13 +557,20 @@ def process_samples(model, samples, output_dir, model_name):
         print(f"Skipped {skipped_unreadable} frame(s) that could not be read")
     print(f"Saved {saved} overlay image(s) to: {output_dir}")
 
+    if metrics_csv_path is None:
+        metrics_csv_path = os.path.join(output_dir, f"metrics_{model_name}.csv")
+    if metric_rows:
+        write_metrics_csv(metric_rows, metrics_csv_path)
+
     return {
         "preprocessing_times": preprocessing_times,
         "inference_times": inference_times,
         "postprocessing_times": postprocessing_times,
         "dice_scores": dice_scores,
         "iou_scores": iou_scores,
+        "nsd_scores": nsd_scores,
         "frame_count": saved,
+        "metrics_csv_path": metrics_csv_path if metric_rows else None,
     }
 
 
@@ -523,6 +633,11 @@ def print_statistics(stats):
         print("\nOverlap vs Ground Truth:")
         print(f"  Dice mean: {np.mean(stats['dice_scores']):.4f}  std: {np.std(stats['dice_scores']):.4f}")
         print(f"  IoU mean:  {np.mean(stats['iou_scores']):.4f}  std: {np.std(stats['iou_scores']):.4f}")
+        if stats.get("nsd_scores"):
+            print(
+                f"  NSD mean:  {np.mean(stats['nsd_scores']):.4f}  std: {np.std(stats['nsd_scores']):.4f}"
+                f"  (tau={NSD_TOLERANCE:g} px)"
+            )
 
     print("=" * 80)
 
@@ -532,6 +647,8 @@ def main():
         print("Usage: python inference_images_monai.py <model_path> <supervisely_path> [output_dir]")
         print("Example: python inference_images_monai.py model_tvus.pt /path/to/TVUS_Niches")
         print("Example: python inference_images_monai.py model_tvus.pt /path/to/TVUS_Niches overlays")
+        print("Annotation JSON and videos are searched recursively under <supervisely_path>.")
+        print("Per-frame Dice/IoU/NSD/timing metrics are written to <output_dir>/metrics_<model>.csv")
         sys.exit(1)
 
     model_path = sys.argv[1]
@@ -566,6 +683,8 @@ def main():
 
     stats = process_samples(model, samples, output_dir, model_name)
     print_statistics(stats)
+    if stats.get("metrics_csv_path"):
+        print(f"Metrics CSV: {stats['metrics_csv_path']}")
     print("\nAll annotated images processed successfully!")
 
 

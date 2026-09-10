@@ -193,11 +193,11 @@ def get_video_files(input_path):
             print(f"Warning: {input_path} is not a recognized video file")
     elif path.is_dir():
         for ext in video_extensions:
-            video_files.extend(path.glob(f"*{ext}"))
-            video_files.extend(path.glob(f"*{ext.upper()}"))
+            video_files.extend(path.rglob(f"*{ext}"))
+            video_files.extend(path.rglob(f"*{ext.upper()}"))
         video_files = [str(f) for f in video_files]
         video_files.sort()
-        print(f"Found {len(video_files)} video file(s) in folder: {input_path}")
+        print(f"Found {len(video_files)} video file(s) in folder (including subfolders): {input_path}")
     else:
         print(f"Error: {input_path} is not a valid file or folder")
 
